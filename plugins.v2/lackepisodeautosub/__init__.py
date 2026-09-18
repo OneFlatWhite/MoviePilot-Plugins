@@ -22,6 +22,9 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.3.2  修复严重 bug：订阅阶段与扫描阶段共用同一个超时计时，
+          大库扫满超时预算后订阅阶段被秒判「超时收尾」，候选剧一部都订不出去；
+          现改为订阅阶段从进入时独立计时（时长仍=配置的扫描超时分钟数）
   v1.3.1  修复：msChain.items() 返回生成器时被进度统计提前消费，
           导致整轮扫描 0 部的严重 bug（先 list() 物化再统计）
   v1.3.0  实时进度与可见性大修：
@@ -114,7 +117,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -848,16 +851,20 @@ class LackEpisodeAutoSub(_PluginBase):
                         f"每部间隔 {self._subscribe_interval} 秒")
 
         consecutive_failures = 0  # 连续失败计数（成功即清零）
+        # v1.3.2 修复：订阅阶段使用独立时间窗（从订阅阶段开始重新计时），
+        # 不再与扫描阶段共用 start_time——大库扫满 60 分钟后，
+        # 旧逻辑会让订阅阶段 2 秒内就被判超时，334 部候选一部都订不出去
+        subscribe_start = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
         for index, cand in enumerate(candidates):
-            # 【风控】超时保护：订阅阶段同样兜底
-            if self.__is_timeout(start_time):
+            # 【风控】订阅阶段超时保护：从订阅阶段开始独立计时
+            if self.__is_timeout(subscribe_start):
                 timeout_hit = True
                 logger.warning(f"【{self.plugin_name}】订阅阶段超过 "
                                f"{self._scan_timeout} 分钟，本轮提前收尾")
                 self.__append_history(
                     history, title="（系统）", year="", tmdbid=0, lack_info={},
                     missing_count=0, result="超时收尾",
-                    message=f"超过 {self._scan_timeout} 分钟，剩余 {len(candidates) - index} 部留待下轮")
+                    message=f"订阅阶段超过 {self._scan_timeout} 分钟，剩余 {len(candidates) - index} 部留待下轮")
                 break
 
             title = cand["title"]
