@@ -1,0 +1,19 @@
+{
+ "LackEpisodeAutoSub": {
+  "name": "缺集自动补齐",
+  "release": true,
+  "description": "定时扫描 Emby 剧集库找出缺集的剧，按优先级策略（地区/动漫/纪录片/缺集数/评分）与每日配额自动订阅，并通过下载验证回环盯梢：复查入库、死任务检测、磁盘告警，形成完整闭环。",
+  "labels": "订阅,补集,Emby",
+  "version": "1.2.2",
+  "icon": "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png",
+  "author": "coldbrew",
+  "level": 1,
+  "history": {
+   "v1.2.2": "扫描周期改为小白友好的「频率下拉 + 几点几分」组合，内部仍生成 cron；老配置 cron 字段自动迁移",
+   "v1.2.1": "补上抽象方法 get_api（修复真机加载失败），注册 /scan 与 /status 两个 API（apikey 鉴权）",
+   "v1.2.0": "新增下载验证回环：订阅后复查 Emby 是否真入库（7 天未入库告警）、qb 死任务检测、下载目录磁盘告警",
+   "v1.1.0": "新增优先级策略（优先地区多选/动漫/纪录片分层 + 缺集数/评分排序规则）与风控三连（订阅间隔、连续失败熔断、单轮超时保护）",
+   "v1.0.0": "首版：Emby 缺集扫描 + 每日配额自动订阅，支持调试模式"
+  }
+ }
+}
