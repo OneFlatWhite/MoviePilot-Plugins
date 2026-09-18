@@ -22,6 +22,14 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.3.1  修复：msChain.items() 返回生成器时被进度统计提前消费，
+          导致整轮扫描 0 部的严重 bug（先 list() 物化再统计）
+  v1.3.0  实时进度与可见性大修：
+          ①详情页顶部新增「运行进度卡片」——进度条 + 当前正在扫的剧名 +
+            本轮实时计数（已扫描/发现缺集/已订阅/跳过/失败），扫描没跑完也能看到数字；
+          ②历史记录改为每产生一条就立刻落盘（原来整轮结束才保存，中途看是空的）；
+          ③订阅阶段开始前明确打印候选数与当日剩余配额，订阅中每部更新进度；
+          ④GET /status API 同步返回 progress 字段，方便外部轮询进度条
   v1.2.2  扫描周期改为小白友好的「频率下拉 + 几点几分」组合，内部仍生成 cron；
           老配置的 cron 字段自动迁移（能解析映射为对应频率，不能则落入自定义）
   v1.2.1  补上抽象方法 get_api（修复真机加载失败），注册 /scan 与 /status 两个 API
@@ -106,7 +114,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -182,6 +190,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_STATS = "stats"                # 累计统计
     _DATA_PENDING = "pending_verify"     # 已订阅未核销的剧 {tmdbid: 快照}
     _DATA_DEAD = "dead_tasks"            # 最近一轮疑似死任务快照（详情页展示用）
+    _DATA_PROGRESS = "progress"          # 本轮实时进度快照（详情页进度条 / API 轮询用）
 
     # ==================================================================
     # 插件生命周期
@@ -216,6 +225,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 self.save_data(self._DATA_STATS, {})
                 self.save_data(self._DATA_PENDING, {})
                 self.save_data(self._DATA_DEAD, [])
+                self.save_data(self._DATA_PROGRESS, {})
                 self._clear_history = False
                 logger.info(f"【{self.plugin_name}】历史记录与已处理清单已清空")
                 self.__update_config()
@@ -522,6 +532,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     "total_timeout": stats.get("total_timeout", 0),    # 超时未补齐数
                     "today_subscribed": today_count,                # 今日已订阅数
                     "daily_quota": self._daily_quota,               # 今日配额
+                    "progress": self.get_data(self._DATA_PROGRESS) or {},  # 实时进度快照
                 },
             }
         except Exception as e:
@@ -531,6 +542,34 @@ class LackEpisodeAutoSub(_PluginBase):
     # ==================================================================
     # 核心主流程
     # ==================================================================
+    def __save_progress(self, progress: Dict[str, Any]):
+        """
+        实时进度快照落盘（v1.3.0 新增）。
+        详情页进度卡片与 /status API 都读它；写盘是几 KB 的 pickle，
+        扫描循环里每 10 部调一次、关键事件（发现缺集/订阅成败）立即调一次，
+        开销可忽略，换来「扫到一半也能看到数字」。
+        """
+        try:
+            self.save_data(self._DATA_PROGRESS, progress)
+        except Exception as e:
+            logger.debug(f"【{self.plugin_name}】保存进度快照失败（不影响主流程）: {e}")
+
+    @staticmethod
+    def __calc_percent(progress: Dict[str, Any]) -> int:
+        """计算进度百分比：扫描阶段=已扫/剧集总数；订阅阶段=已处理/候选数"""
+        try:
+            if progress.get("phase") == "subscribing":
+                total = int(progress.get("candidates", 0))
+                done = int(progress.get("sub_done", 0))
+            else:
+                total = int(progress.get("total", 0))
+                done = int(progress.get("scanned", 0))
+            if total <= 0:
+                return 0
+            return min(100, int(done * 100 / total))
+        except Exception:
+            return 0
+
     def __scan(self):
         """
         主流程（每轮 cron 触发）：
@@ -585,6 +624,29 @@ class LackEpisodeAutoSub(_PluginBase):
         # 获取当日剩余配额
         remaining_quota = self.__get_remaining_quota()
 
+        # ---------- 实时进度快照初始化（v1.3.0）----------
+        progress: Dict[str, Any] = {
+            "running": True,                 # 是否正在跑
+            "phase": "scanning",             # scanning=扫描中 / subscribing=订阅中 / done=完成
+            "phase_label": "扫描媒体库中",
+            "total": 0,                      # 已发现的剧集总数（随媒体库读取逐步增加）
+            "scanned": 0,                    # 已扫描部数
+            "missing": 0,                    # 发现缺集部数
+            "candidates": 0,                 # 进入候选部数
+            "subscribed": 0,                 # 本轮已订阅部数
+            "skipped": 0,                    # 本轮跳过部数
+            "failed": 0,                     # 本轮失败部数
+            "sub_done": 0,                   # 订阅阶段已处理候选数
+            "current": "",                   # 当前正在处理的剧名
+            "quota_left": remaining_quota,   # 当日剩余配额
+            "percent": 0,
+            "dry_run": self._dry_run,
+            "started_at": start_time.strftime(TIME_FMT),
+            "finished_at": "",
+            "elapsed_sec": 0,
+        }
+        self.__save_progress(progress)
+
         # ---------- 3. 遍历媒体服务器 ----------
         try:
             mediaservers = self._msHelper.get_services()
@@ -596,6 +658,12 @@ class LackEpisodeAutoSub(_PluginBase):
             # 验证/死任务/磁盘环节已执行过，仍需保存历史后返回
             self.save_data(self._DATA_HISTORY, history[-200:])
             self.save_data(self._DATA_STATS, stats)
+            progress.update({"running": False, "phase": "done",
+                             "phase_label": "本轮已完成",
+                             "current": "",
+                             "finished_at": datetime.datetime.now(
+                                 tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT)})
+            self.__save_progress(progress)
             return
 
         # 候选清单：本轮发现缺集、且通过所有过滤的剧（dict 列表，含优先级判定所需字段）
@@ -630,6 +698,19 @@ class LackEpisodeAutoSub(_PluginBase):
                 if not items:
                     continue
 
+                # 关键：msChain.items() 可能返回生成器，先物化成列表，
+                # 否则下面统计总数的 sum() 会把生成器消费掉，循环就扫不到任何剧
+                items = list(items)
+
+                # 进度：把本库的剧集数计入总数（总数随媒体库读取逐步增加）
+                try:
+                    progress["total"] += sum(
+                        1 for it in items
+                        if it and it.item_type in ["Series", "show"])
+                    self.__save_progress(progress)
+                except Exception:
+                    pass
+
                 for item in items:
                     # 【风控】单轮超时保护：超时就收尾，已扫描结果保留
                     if self.__is_timeout(start_time):
@@ -644,6 +725,17 @@ class LackEpisodeAutoSub(_PluginBase):
                         continue
                     scanned += 1
                     title = item.title or item.original_title or f"ItemID:{item.item_id}"
+
+                    # 进度：每 10 部落盘一次（关键事件另有立即落盘）
+                    progress["scanned"] = scanned
+                    progress["current"] = title
+                    progress["missing"] = missing_shows
+                    progress["candidates"] = len(candidates)
+                    progress["skipped"] = skipped
+                    progress["failed"] = failed
+                    progress["percent"] = self.__calc_percent(progress)
+                    if scanned % 10 == 0:
+                        self.__save_progress(progress)
 
                     try:
                         # ---- 过滤 1：排除关键词 ----
@@ -688,6 +780,8 @@ class LackEpisodeAutoSub(_PluginBase):
 
                         total_missing = sum(len(eps) for eps in lack_info.values())
                         missing_shows += 1
+                        progress["missing"] = missing_shows
+                        self.__save_progress(progress)
 
                         # ---- 过滤 4：缺集数超过上限（可能整部识别错误） ----
                         if self._max_missing > 0 and total_missing > self._max_missing:
@@ -737,6 +831,22 @@ class LackEpisodeAutoSub(_PluginBase):
         candidates = self.__sort_candidates(candidates)
 
         # ---------- 3.4 按配额 + 风控订阅 ----------
+        # 进度切换到订阅阶段，并明确打印配额（之前没有这行，看起来像"卡住没订阅"）
+        progress.update({
+            "phase": "subscribing", "phase_label": "订阅候选剧中",
+            "candidates": len(candidates), "sub_done": 0, "percent": 0,
+        })
+        self.__save_progress(progress)
+        if self._dry_run:
+            logger.info(f"【{self.plugin_name}】调试模式：{len(candidates)} 部候选"
+                        f"仅记录不订阅")
+        elif not candidates:
+            logger.info(f"【{self.plugin_name}】本轮无候选剧需要订阅")
+        else:
+            logger.info(f"【{self.plugin_name}】进入订阅阶段：候选 {len(candidates)} 部，"
+                        f"今日剩余配额 {remaining_quota} 部，"
+                        f"每部间隔 {self._subscribe_interval} 秒")
+
         consecutive_failures = 0  # 连续失败计数（成功即清零）
         for index, cand in enumerate(candidates):
             # 【风控】超时保护：订阅阶段同样兜底
@@ -751,6 +861,8 @@ class LackEpisodeAutoSub(_PluginBase):
                 break
 
             title = cand["title"]
+            progress["current"] = title
+            progress["quota_left"] = remaining_quota
 
             # 调试模式：只记录，不订阅、不消耗配额、不标记已处理、不进入验证回环
             if self._dry_run:
@@ -758,6 +870,9 @@ class LackEpisodeAutoSub(_PluginBase):
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
                     result="调试-待订阅", message="调试模式未真正订阅")
+                progress["sub_done"] = index + 1
+                progress["percent"] = self.__calc_percent(progress)
+                self.__save_progress(progress)
                 continue
 
             # 【风控】每日配额控制：超出配额的剧不标记已处理，留到明天继续
@@ -778,6 +893,11 @@ class LackEpisodeAutoSub(_PluginBase):
                 subscribed += 1
                 consecutive_failures = 0  # 成功一次，连续失败清零
                 remaining_quota -= 1
+                progress["subscribed"] = subscribed
+                progress["sub_done"] = index + 1
+                progress["quota_left"] = remaining_quota
+                progress["percent"] = self.__calc_percent(progress)
+                self.__save_progress(progress)
                 self.__incr_daily_quota()
                 subscribed_titles.append(f"{title}（缺 {cand['missing']} 集）")
                 # 标记已处理，下一轮不再重复
@@ -796,6 +916,10 @@ class LackEpisodeAutoSub(_PluginBase):
             else:
                 failed += 1
                 consecutive_failures += 1
+                progress["failed"] = failed
+                progress["sub_done"] = index + 1
+                progress["percent"] = self.__calc_percent(progress)
+                self.__save_progress(progress)
                 self.__append_history(
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
@@ -827,6 +951,21 @@ class LackEpisodeAutoSub(_PluginBase):
 
         elapsed = (datetime.datetime.now(tz=pytz.timezone(settings.TZ))
                    - start_time).total_seconds()
+
+        # 进度收尾：标记完成，页面进度条显示本轮最终结果
+        progress.update({
+            "running": False, "phase": "done", "phase_label": "本轮已完成",
+            "scanned": scanned, "missing": missing_shows,
+            "candidates": len(candidates), "subscribed": subscribed,
+            "skipped": skipped, "failed": failed,
+            "current": "", "quota_left": remaining_quota,
+            "percent": 100,
+            "finished_at": datetime.datetime.now(
+                tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+            "elapsed_sec": int(elapsed),
+        })
+        self.__save_progress(progress)
+
         logger.info(f"【{self.plugin_name}】===== 本轮结束，耗时 {elapsed:.0f} 秒："
                     f"新增订阅 {subscribed} 部，跳过 {skipped} 部，失败 {failed} 部"
                     f"{'，已熔断' if circuit_broken else ''}"
@@ -1442,11 +1581,11 @@ class LackEpisodeAutoSub(_PluginBase):
         daily["count"] = int(daily.get("count", 0)) + 1
         self.save_data(self._DATA_DAILY, daily)
 
-    @staticmethod
-    def __append_history(history: List[Dict[str, Any]], title: str, year: str,
+    def __append_history(self, history: List[Dict[str, Any]], title: str, year: str,
                          tmdbid: int, lack_info: Dict[int, List[int]],
                          missing_count: int, result: str, message: str):
-        """追加一条历史记录"""
+        """追加一条历史记录并立即落盘（v1.3.0：原来整轮结束才保存，
+        扫描中途打开详情页看不到任何记录，现在每产生一条就能在页面看到）"""
         history.append({
             "time": datetime.datetime.now(
                 tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
@@ -1458,6 +1597,10 @@ class LackEpisodeAutoSub(_PluginBase):
             "result": result,
             "message": message or "",
         })
+        try:
+            self.save_data(self._DATA_HISTORY, history[-200:])
+        except Exception as e:
+            logger.debug(f"【{self.plugin_name}】保存历史记录失败（不影响主流程）: {e}")
 
     def __send_summary(self, scanned: int, missing_shows: int, subscribed: int,
                        skipped: int, failed: int,
@@ -1935,7 +2078,94 @@ class LackEpisodeAutoSub(_PluginBase):
                 }]
             }
 
-        page = [
+        # ---- 实时进度卡片（v1.3.0）：扫描没跑完也能看到数字与进度条 ----
+        progress_data = self.get_data(self._DATA_PROGRESS) or {}
+        progress_rows: List[dict] = []
+        if progress_data.get("running"):
+            _pct = int(progress_data.get("percent", 0))
+            _phase = progress_data.get("phase_label", "运行中")
+            _cur = progress_data.get("current", "")
+            _total = int(progress_data.get("total", 0))
+            _scanned = int(progress_data.get("scanned", 0))
+            _bar_props = {
+                'color': 'primary', 'height': 20, 'striped': True,
+                'class': 'mb-2',
+            }
+            if _total > 0:
+                _bar_props['model-value'] = _pct
+            else:
+                # 总数还没读出来（正在读第一个媒体库），显示不定态滚动条
+                _bar_props['indeterminate'] = True
+            progress_rows.append({
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'VCard',
+                        'props': {'variant': 'tonal', 'color': 'primary'},
+                        'content': [
+                            {
+                                'component': 'VCardTitle',
+                                'props': {'class': 'text-subtitle-1'},
+                                'text': f"⏳ 正在运行：{_phase}"
+                                        f"{'（调试模式，不会真订阅）' if progress_data.get('dry_run') else ''}"
+                            },
+                            {
+                                'component': 'VCardText',
+                                'content': [
+                                    {'component': 'VProgressLinear',
+                                     'props': _bar_props},
+                                    {'component': 'div',
+                                     'props': {'class': 'text-body-2 mb-1'},
+                                     'text': (f"进度 {_pct}%：已扫描 {_scanned}"
+                                              f"{f' / {_total}' if _total else ''} 部剧"
+                                              f"{'（总数随媒体库读取逐步增加）' if progress_data.get('phase') == 'scanning' else ''}")},
+                                    {'component': 'div',
+                                     'props': {'class': 'text-body-2 mb-1'},
+                                     'text': f"正在处理：{_cur}" if _cur else "正在处理：…"},
+                                    {'component': 'div',
+                                     'props': {'class': 'text-body-2 mb-1'},
+                                     'text': (f"本轮实时：发现缺集 {progress_data.get('missing', 0)} 部 · "
+                                              f"候选 {progress_data.get('candidates', 0)} 部 · "
+                                              f"已订阅 {progress_data.get('subscribed', 0)} 部 · "
+                                              f"跳过 {progress_data.get('skipped', 0)} 部 · "
+                                              f"失败 {progress_data.get('failed', 0)} 部 · "
+                                              f"今日剩余配额 {progress_data.get('quota_left', 0)} 部")},
+                                    {'component': 'div',
+                                     'props': {'class': 'text-caption text-grey'},
+                                     'text': (f"开始于 {progress_data.get('started_at', '')}。"
+                                              f"页面不会自动刷新，重新打开本卡片即可查看最新进度。")},
+                                ]
+                            },
+                        ]
+                    }]
+                }]
+            })
+        elif progress_data.get("finished_at"):
+            _min = round(int(progress_data.get("elapsed_sec", 0)) / 60, 1)
+            progress_rows.append({
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'success', 'variant': 'tonal', 'density': 'compact',
+                            'text': (f"上一轮已于 {progress_data.get('finished_at')} 完成："
+                                     f"扫描 {progress_data.get('scanned', 0)} 部 · "
+                                     f"发现缺集 {progress_data.get('missing', 0)} 部 · "
+                                     f"订阅 {progress_data.get('subscribed', 0)} 部 · "
+                                     f"跳过 {progress_data.get('skipped', 0)} 部 · "
+                                     f"失败 {progress_data.get('failed', 0)} 部 · "
+                                     f"耗时 {_min} 分钟")
+                        }
+                    }]
+                }]
+            })
+
+        page = progress_rows + [
             # ---- 统计卡片（两行：扫描订阅类 + 验证回环类） ----
             {
                 'component': 'VRow',
