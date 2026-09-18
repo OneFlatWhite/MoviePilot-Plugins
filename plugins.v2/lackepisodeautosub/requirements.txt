@@ -1,3 +1,2 @@
-# 缺集自动补齐（LackEpisodeAutoSub）
-# 本插件仅使用 MoviePilot V2 内置模块（apscheduler / pytz / app.* 功能链），
-# 无需安装任何额外依赖。此文件留空即可，保留仅为符合插件目录惯例。
+telethon>=1.36
+python-socks[asyncio]>=2.4

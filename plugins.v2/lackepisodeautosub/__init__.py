@@ -22,6 +22,17 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.4.0  新增「爱影 115 通道」（实验功能）：
+          ①插件内嵌 TG 用户态会话管理器（Telethon + 独立 daemon 线程跑 asyncio
+            事件循环，同步代码经 run_coroutine_threadsafe 调用），会话文件存插件
+            数据目录，Telethon 未安装/未登录时整体降级为「未启用」，绝不影响 PT 主流程；
+          ②缺集订阅前先问资源机器人（默认 @ayclub_bot）拿 ed2k/115 链接，
+            转发给 SA 转存机器人自动离线到 115，全部补齐则不再走 MP 订阅，
+            部分补齐则剩余集落回 PT 兜底（history 标注混合渠道）；
+          ③新增 /tg_send_code /tg_verify /tg_status 三个登录 API，
+            配置页提供一次性开关完成「发验证码/完成登录」全流程；
+          ④验证回环核销时，115 渠道已补齐的剧自动退订本插件此前添加的 PT 订阅，
+            避免重复下载；通知与历史记录区分 [爱影115] / [PT下载] 来源
   v1.3.2  修复严重 bug：订阅阶段与扫描阶段共用同一个超时计时，
           大库扫满超时预算后订阅阶段被秒判「超时收尾」，候选剧一部都订不出去；
           现改为订阅阶段从进入时独立计时（时长仍=配置的扫描超时分钟数）
@@ -43,6 +54,7 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
 import datetime
 import os
 import re
+import threading
 import time
 import traceback
 from threading import Event as ThreadEvent
@@ -51,6 +63,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+# FastAPI Body：插件 API 接收 JSON body 用（MP 用 app.add_api_route 直接注册端点，
+# 支持 FastAPI 依赖注入）；极端情况下导入失败则退化为普通查询参数
+try:
+    from fastapi import Body
+except Exception:
+    Body = None
 
 from app.chain.media import MediaChain
 from app.chain.mediaserver import MediaServerChain
@@ -108,6 +127,453 @@ SCAN_FREQ_OPTIONS: Dict[str, str] = {
 # 时间字符串格式（订阅时间戳持久化用）
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
+# ---------------------------------------------------------------------------
+# 爱影 115 通道：TG 用户态会话（v1.4.0 新增）
+# ---------------------------------------------------------------------------
+
+# Telegram Desktop 官方开源公开凭证（github.com/telegramdesktop/tdesktop 源码内）
+TG_API_ID = 2040
+TG_API_HASH = "b18441a1ff607e10a989891a5462e627"
+# 默认代理（NAS 本地代理，Telegram 直连不可达时需要）
+TG_DEFAULT_PROXY = "http://192.168.31.40:7890"
+
+# 爱影资源列表行：🧲 [国漫] 斗罗大陆Ⅱ绝世唐门 (2023) {tmdb-228429} S01E171 4K TX WEB-DL 1.57G
+_AIYING_LINE_RE = re.compile(r"\{tmdb-(\d+)\}\s*S(\d+)E(\d+)\b(.*)", re.I)
+# 行尾文件大小（1.57G / 800M / 500K）
+_AIYING_SIZE_RE = re.compile(r"([\d.]+)\s*([GMK])B?\s*[-\s]*$", re.I)
+# 回复里的「本月剩余次数：997」
+_AIYING_QUOTA_RE = re.compile(r"本月剩余次数[：:]\s*(\d+)")
+# 115 分享链接
+_LINK_115_RE = re.compile(r"https?://(?:115\.com|115cdn\.com|115cdn\.net)/s/[A-Za-z0-9]+[^\s<>\"']*")
+# ed2k 链接
+_ED2K_RE = re.compile(r"ed2k://\|file\|[^\s]+")
+# 按钮文字里的季集号（兼容 S1E171 / S01E171 两种写法）
+_BTN_SE_RE = re.compile(r"S0*(\d+)E0*(\d+)", re.I)
+
+# Telethon 兜底导入：依赖未装上时插件照常加载，爱影通道整体降级为「未启用」
+try:
+    import asyncio
+    from telethon import TelegramClient
+    from telethon.errors import SessionPasswordNeededError
+    _TG_LIB_OK = True
+except Exception:
+    asyncio = None
+    TelegramClient = None
+    SessionPasswordNeededError = Exception
+    _TG_LIB_OK = False
+
+
+def _parse_aiying_lines(text: str) -> List[Dict[str, Any]]:
+    """
+    解析爱影资源列表文本，返回条目列表：
+      {"tmdbid": int, "season": int, "episode": int, "qrank": int, "size": float(MB)}
+    qrank：画质档位（2160p/4K=3，1080p=2，720p=1，其他=0）；size 统一折算成 MB 便于比较。
+    纯函数，不依赖 MP/TG 环境，可独立测试。
+    """
+    entries: List[Dict[str, Any]] = []
+    for line in (text or "").splitlines():
+        m = _AIYING_LINE_RE.search(line)
+        if not m:
+            continue
+        tail = m.group(4) or ""
+        # 解析文件大小，统一折算成 MB
+        size_mb = 0.0
+        sm = _AIYING_SIZE_RE.search(tail.strip())
+        if sm:
+            try:
+                size_mb = float(sm.group(1))
+                unit = sm.group(2).upper()
+                if unit == "G":
+                    size_mb *= 1024
+                elif unit == "K":
+                    size_mb /= 1024
+            except (TypeError, ValueError):
+                size_mb = 0.0
+        # 解析画质档位
+        upper = tail.upper()
+        if "2160P" in upper or "4K" in upper:
+            qrank = 3
+        elif "1080P" in upper:
+            qrank = 2
+        elif "720P" in upper:
+            qrank = 1
+        else:
+            qrank = 0
+        entries.append({
+            "tmdbid": int(m.group(1)),
+            "season": int(m.group(2)),
+            "episode": int(m.group(3)),
+            "qrank": qrank,
+            "size": size_mb,
+        })
+    return entries
+
+
+class _AiyingTgManager:
+    """
+    TG 用户态会话管理器（进程内单例，v1.4.0 新增）。
+
+    独立 daemon 线程跑 asyncio 事件循环，插件同步代码经
+    asyncio.run_coroutine_threadsafe 提交协程调用；Telethon 客户端只在该
+    循环线程内创建与使用，避免跨线程/跨循环问题。
+    所有 public 方法自带 try/except 兜底，任何异常都只返回错误字典，
+    绝不向上抛，确保 PT 订阅主流程不受影响。
+    """
+
+    def __init__(self):
+        self._loop = None                  # 独立线程里的 asyncio 事件循环
+        self._thread: Optional[threading.Thread] = None
+        self._client = None                # Telethon 客户端（只在循环线程内使用）
+        self._session_path: str = ""       # 会话文件路径
+        self._proxy_url: str = ""          # 代理地址
+        self._phone_code_hash: Optional[str] = None  # 登录中间态
+        self._login_phone: str = ""
+
+    # ------------------------- 同步封装（插件线程调用） -------------------------
+    def configure(self, session_path: str, proxy_url: str):
+        """配置会话文件与代理；配置变化时丢弃旧客户端，下次使用自动重连"""
+        try:
+            session_path = str(session_path or "")
+            proxy_url = str(proxy_url or "")
+            if session_path != self._session_path or proxy_url != self._proxy_url:
+                self._disconnect()
+            self._session_path = session_path
+            self._proxy_url = proxy_url
+        except Exception:
+            pass
+
+    def status(self) -> Dict[str, Any]:
+        """查询登录状态：{ok, logged_in, username, first_name, phone, error}"""
+        if not _TG_LIB_OK:
+            return {"ok": False, "logged_in": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(self.__status_async(), timeout=60)
+        except Exception as e:
+            return {"ok": False, "logged_in": False, "error": str(e)}
+
+    def send_code(self, phone: str) -> Dict[str, Any]:
+        """发送登录验证码"""
+        if not _TG_LIB_OK:
+            return {"ok": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(self.__send_code_async(phone), timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def verify(self, phone: str, code: str, password: str = "") -> Dict[str, Any]:
+        """提交验证码完成登录（支持两步验证密码）"""
+        if not _TG_LIB_OK:
+            return {"ok": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(self.__verify_async(phone, code, password), timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def collect(self, bot: str, keyword: str, tmdbid: int,
+                lack_eps: Set[Tuple[int, int]], max_pages: int = 5,
+                interval: int = 3, click_budget: int = 100) -> Dict[str, Any]:
+        """
+        给爱影机器人发关键词，分页收集缺集条目并逐集点击按钮拿 ed2k/115 链接。
+        返回：{ok, links: {(季,集): url}, quota_left, clicks, error}
+        """
+        if not _TG_LIB_OK:
+            return {"ok": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(
+                self.__collect_async(bot, keyword, tmdbid, lack_eps,
+                                     max_pages, interval, click_budget),
+                timeout=600)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def submit(self, sa_bot: str, items: List[Tuple[str, str]],
+               interval: int = 3) -> Dict[str, Any]:
+        """
+        把 ed2k/115 链接逐条发给 SA 转存机器人。
+        items: [(集标签如 S01E03, 链接)]；返回 {ok, results: {标签: {ok, msg}}}
+        判定：回复含「失败」且不含「任务已存在」记失败，其余（含超时无回复前的成功回复）记成功。
+        """
+        if not _TG_LIB_OK:
+            return {"ok": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(self.__submit_async(sa_bot, items, interval), timeout=900)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def shutdown(self):
+        """优雅关闭：断开客户端并停止事件循环线程（下次使用自动重建）"""
+        try:
+            self._disconnect()
+            loop = self._loop
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+            self._loop = None
+            self._thread = None
+        except Exception:
+            pass
+
+    # ------------------------- 内部：事件循环与客户端 -------------------------
+    def _disconnect(self):
+        """在当前配置下断开并丢弃 Telethon 客户端"""
+        try:
+            if self._client and self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._client.disconnect(), self._loop).result(15)
+        except Exception:
+            pass
+        self._client = None
+
+    def _ensure_loop(self):
+        """确保独立 daemon 线程与事件循环已启动"""
+        if self._loop and self._loop.is_running():
+            return
+        self._loop = None
+
+        def _thread_main():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            loop.run_forever()
+
+        self._thread = threading.Thread(
+            target=_thread_main, name="aiying-tg-loop", daemon=True)
+        self._thread.start()
+        # 等循环就绪（最多 5 秒）
+        for _ in range(50):
+            if self._loop and self._loop.is_running():
+                break
+            time.sleep(0.1)
+        if not (self._loop and self._loop.is_running()):
+            raise RuntimeError("TG 事件循环启动失败")
+
+    def __run(self, coro, timeout: int = 120):
+        """把协程提交到独立事件循环并同步等待结果"""
+        self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout)
+
+    async def __ensure_client(self):
+        """在循环线程内确保 Telethon 客户端已创建并连接"""
+        if self._client is None:
+            proxy = None
+            m = re.match(r"^(https?|socks5?)://([^:/]+):(\d+)$",
+                         (self._proxy_url or "").strip())
+            if m:
+                scheme = "socks5" if m.group(1).startswith("socks") else "http"
+                proxy = (scheme, m.group(2), int(m.group(3)))
+            self._client = TelegramClient(
+                self._session_path, TG_API_ID, TG_API_HASH, proxy=proxy)
+        if not self._client.is_connected():
+            await self._client.connect()
+        return self._client
+
+    # ------------------------- 内部：协程实现 -------------------------
+    async def __status_async(self) -> Dict[str, Any]:
+        client = await self.__ensure_client()
+        if not await client.is_user_authorized():
+            return {"ok": True, "logged_in": False}
+        me = await client.get_me()
+        return {
+            "ok": True,
+            "logged_in": True,
+            "username": getattr(me, "username", "") or "",
+            "first_name": getattr(me, "first_name", "") or "",
+            "phone": getattr(me, "phone", "") or "",
+        }
+
+    async def __send_code_async(self, phone: str) -> Dict[str, Any]:
+        client = await self.__ensure_client()
+        result = await client.send_code_request(phone)
+        # phone_code_hash 存内存单例，/tg_verify 时用
+        self._phone_code_hash = result.phone_code_hash
+        self._login_phone = phone
+        return {"ok": True}
+
+    async def __verify_async(self, phone: str, code: str,
+                             password: str = "") -> Dict[str, Any]:
+        client = await self.__ensure_client()
+        # TG 验证码常被用户带空格/横杠复制，先清洗
+        code = re.sub(r"[\s-]+", "", code or "")
+        try:
+            await client.sign_in(phone, code,
+                                 phone_code_hash=self._phone_code_hash)
+        except SessionPasswordNeededError:
+            if not password:
+                return {"ok": False,
+                        "error": "账号开启了两步验证，请填写两步验证密码后重试"}
+            await client.sign_in(password=password)
+        me = await client.get_me()
+        return {
+            "ok": True,
+            "logged_in": True,
+            "username": getattr(me, "username", "") or "",
+            "first_name": getattr(me, "first_name", "") or "",
+            "phone": getattr(me, "phone", "") or "",
+        }
+
+    async def __wait_reply(self, client, bot: str, sent, timeout: int = 40):
+        """等机器人回复：每 2 秒拉一次最新消息，取发送之后的第一条机器人消息"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(2)
+            msgs = await client.get_messages(bot, limit=5)
+            for m in msgs:
+                if not m.out and sent is not None and m.id > sent.id:
+                    return m
+        return None
+
+    async def __wait_link(self, client, bot: str,
+                          before_ids: Set[int], timeout: int = 15) -> Optional[str]:
+        """点击按钮后等机器人发含 ed2k/115 链接的新消息，返回第一个链接"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(2)
+            async for m in client.iter_messages(bot, limit=10):
+                if m.id in before_ids:
+                    break
+                if m.out:
+                    continue
+                text = m.text or ""
+                ed2k = _ED2K_RE.findall(text)
+                if ed2k:
+                    return ed2k[0]
+                links115 = _LINK_115_RE.findall(text)
+                if links115:
+                    return links115[0]
+        return None
+
+    async def __collect_async(self, bot: str, keyword: str, tmdbid: int,
+                              lack_eps: Set[Tuple[int, int]], max_pages: int,
+                              interval: int, click_budget: int) -> Dict[str, Any]:
+        client = await self.__ensure_client()
+        if not await client.is_user_authorized():
+            return {"ok": False, "error": "TG 未登录"}
+        bot = (bot or "").lstrip("@")
+        sent = await client.send_message(bot, keyword)
+        reply = await self.__wait_reply(client, bot, sent, timeout=40)
+        if reply is None:
+            return {"ok": False, "error": "等待机器人回复超时"}
+
+        quota_left: Optional[int] = None
+        links: Dict[Tuple[int, int], str] = {}
+        clicks = 0
+        page_msg = reply
+
+        for _page in range(max(1, max_pages)):
+            if not page_msg:
+                break
+            text = page_msg.text or ""
+            # 每页都尝试刷新「本月剩余次数」（翻页后可能变化）
+            qm = _AIYING_QUOTA_RE.search(text)
+            if qm:
+                quota_left = int(qm.group(1))
+
+            # 本页按钮：{(季,集): 按钮文字}
+            btn_map: Dict[Tuple[int, int], str] = {}
+            if page_msg.buttons:
+                for row in page_msg.buttons:
+                    for btn in row:
+                        bm = _BTN_SE_RE.search(btn.text or "")
+                        if bm:
+                            btn_map[(int(bm.group(1)), int(bm.group(2)))] = btn.text
+
+            # 本页条目过滤：tmdbid 一致 + 属于缺集 + 还没拿到链接 + 有对应按钮；
+            # 同一集多条时选码率最高（qrank 优先，其次文件大者优先）
+            best: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            for entry in _parse_aiying_lines(text):
+                key = (entry["season"], entry["episode"])
+                if entry["tmdbid"] != tmdbid:
+                    continue
+                if key not in lack_eps or key in links or key not in btn_map:
+                    continue
+                cur = best.get(key)
+                if cur is None or (entry["qrank"], entry["size"]) > (cur["qrank"], cur["size"]):
+                    best[key] = entry
+
+            # 逐集点击按钮拿 ed2k/115 链接
+            for key in sorted(best.keys()):
+                if clicks >= click_budget:
+                    break
+                before_ids = {m.id async for m in client.iter_messages(bot, limit=10)}
+                try:
+                    await page_msg.click(text=btn_map[key])
+                except Exception:
+                    continue
+                clicks += 1
+                # 风控：每次点击后间隔，防点爆爱影次数
+                await asyncio.sleep(max(1, interval))
+                link = await self.__wait_link(client, bot, before_ids, timeout=15)
+                if link:
+                    links[key] = link
+
+            # 缺集全部覆盖或点击预算用尽：停
+            if all(k in links for k in lack_eps) or clicks >= click_budget:
+                break
+
+            # 翻页：点「下一页」按钮，消息会被编辑，重新拉取
+            next_text = None
+            if page_msg.buttons:
+                for row in page_msg.buttons:
+                    for btn in row:
+                        if "下一页" in (btn.text or ""):
+                            next_text = btn.text
+                            break
+                    if next_text:
+                        break
+            if not next_text:
+                break
+            try:
+                await page_msg.click(text=next_text)
+            except Exception:
+                break
+            await asyncio.sleep(2)
+            try:
+                page_msg = await client.get_messages(bot, ids=page_msg.id)
+            except Exception:
+                break
+
+        return {"ok": True, "links": links, "quota_left": quota_left,
+                "clicks": clicks}
+
+    async def __submit_async(self, sa_bot: str, items: List[Tuple[str, str]],
+                             interval: int) -> Dict[str, Any]:
+        client = await self.__ensure_client()
+        if not await client.is_user_authorized():
+            return {"ok": False, "error": "TG 未登录"}
+        bot = (sa_bot or "").lstrip("@")
+        results: Dict[str, Dict[str, Any]] = {}
+        for label, url in items:
+            try:
+                sent = await client.send_message(bot, url)
+                reply = await self.__wait_reply(client, bot, sent, timeout=30)
+                text = (reply.text or "") if reply else ""
+                # 「115离线下载失败：任务已存在」也算成功（说明 115 已有该文件）
+                if "失败" in text and "任务已存在" not in text:
+                    results[label] = {"ok": False, "msg": (text or "无回复")[:120]}
+                else:
+                    results[label] = {"ok": True, "msg": text[:120]}
+            except Exception as e:
+                results[label] = {"ok": False, "msg": str(e)[:120]}
+            # 风控：逐条间隔
+            await asyncio.sleep(max(1, interval))
+        return {"ok": True, "results": results}
+
+
+# TG 会话管理器进程内单例
+_TG_MANAGER: Optional[_AiyingTgManager] = None
+_TG_MANAGER_LOCK = threading.Lock()
+
+
+def _get_tg_manager() -> Optional[_AiyingTgManager]:
+    """获取 TG 会话管理器单例；Telethon 未安装时返回 None（功能降级）"""
+    global _TG_MANAGER
+    if not _TG_LIB_OK:
+        return None
+    with _TG_MANAGER_LOCK:
+        if _TG_MANAGER is None:
+            _TG_MANAGER = _AiyingTgManager()
+    return _TG_MANAGER
+
 
 class LackEpisodeAutoSub(_PluginBase):
     # 插件名称
@@ -117,7 +583,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -186,6 +652,19 @@ class LackEpisodeAutoSub(_PluginBase):
     _disk_check_path: str = "/video/downloads"  # 磁盘告警检查的容器内路径
     _disk_alert_gb: int = 200            # 剩余空间低于该 GB 数则告警
 
+    # 【爱影 115 通道】（v1.4.0 新增；默认全部兜底，Telethon 缺失时整体不启用）
+    _aiying_enabled: bool = False        # 爱影115通道开关
+    _tg_phone: str = ""                  # TG 手机号（登录你本人 TG 账号）
+    _tg_code: str = ""                   # TG 验证码（一次性，保存后清空）
+    _tg_password: str = ""               # TG 两步验证密码（可空）
+    _tg_proxy: str = TG_DEFAULT_PROXY    # TG 代理地址
+    _tg_send_code_once: bool = False     # 一次性开关：保存配置时发送验证码
+    _tg_verify_once: bool = False        # 一次性开关：保存配置时完成登录
+    _aiying_bot: str = "ayclub_bot"      # 爱影资源机器人用户名
+    _sa_bot: str = ""                    # SA 转存机器人用户名（你的 Symedia 机器人）
+    _aiying_interval: int = 3            # 每集点击/发送间隔秒数（风控）
+    _aiying_max_eps: int = 30            # 每剧经此通道最多补集数（风控）
+
     # 持久化数据的 key
     _DATA_PROCESSED = "processed"        # 已处理（已成功订阅）的剧 {tmdbid: {...}}
     _DATA_HISTORY = "history"            # 运行历史列表（最多保留 200 条）
@@ -194,6 +673,8 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_PENDING = "pending_verify"     # 已订阅未核销的剧 {tmdbid: 快照}
     _DATA_DEAD = "dead_tasks"            # 最近一轮疑似死任务快照（详情页展示用）
     _DATA_PROGRESS = "progress"          # 本轮实时进度快照（详情页进度条 / API 轮询用）
+    _DATA_TG_LOGIN = "tg_login"          # TG 登录状态缓存 {logged_in, username, phone, ...}
+    _DATA_AIYING = "aiying"              # 爱影通道状态 {quota_left: 本月剩余次数, updated: 时间}
 
     # ==================================================================
     # 插件生命周期
@@ -232,6 +713,13 @@ class LackEpisodeAutoSub(_PluginBase):
                 self._clear_history = False
                 logger.info(f"【{self.plugin_name}】历史记录与已处理清单已清空")
                 self.__update_config()
+
+            # 处理「爱影115通道」TG 登录一次性开关（发验证码/完成登录）
+            if self._tg_send_code_once or self._tg_verify_once:
+                try:
+                    self.__handle_tg_login_actions()
+                except Exception as e:
+                    logger.error(f"【{self.plugin_name}】TG 登录动作处理失败（不影响主流程）: {e}")
 
             # 「立即运行一次」：用本地调度器 3 秒后触发一次，与 cron 服务互不影响
             if self._onlyonce:
@@ -330,6 +818,19 @@ class LackEpisodeAutoSub(_PluginBase):
             config.get("disk_check_path") or "/video/downloads").strip()
         self._disk_alert_gb = max(1, self.__to_int(config.get("disk_alert_gb"), 200))
 
+        # 爱影 115 通道（v1.4.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        self._aiying_enabled = bool(config.get("aiying_enabled", False))
+        self._tg_phone = str(config.get("tg_phone") or "").strip()
+        self._tg_code = str(config.get("tg_code") or "").strip()
+        self._tg_password = str(config.get("tg_password") or "")
+        self._tg_proxy = str(config.get("tg_proxy") or TG_DEFAULT_PROXY).strip()
+        self._tg_send_code_once = bool(config.get("tg_send_code_once", False))
+        self._tg_verify_once = bool(config.get("tg_verify_once", False))
+        self._aiying_bot = str(config.get("aiying_bot") or "ayclub_bot").strip().lstrip("@")
+        self._sa_bot = str(config.get("sa_bot") or "").strip().lstrip("@")
+        self._aiying_interval = max(1, self.__to_int(config.get("aiying_interval"), 3))
+        self._aiying_max_eps = max(1, self.__to_int(config.get("aiying_max_eps"), 30))
+
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
         """把配置值安全转成 int，失败用默认值"""
@@ -413,6 +914,18 @@ class LackEpisodeAutoSub(_PluginBase):
             "dead_task_auto_delete": self._dead_task_auto_delete,
             "disk_check_path": self._disk_check_path,
             "disk_alert_gb": self._disk_alert_gb,
+            "aiying_enabled": self._aiying_enabled,
+            "tg_phone": self._tg_phone,
+            # 验证码为一次性输入，回写时清空，避免残留
+            "tg_code": "",
+            "tg_password": self._tg_password,
+            "tg_proxy": self._tg_proxy,
+            "tg_send_code_once": self._tg_send_code_once,
+            "tg_verify_once": self._tg_verify_once,
+            "aiying_bot": self._aiying_bot,
+            "sa_bot": self._sa_bot,
+            "aiying_interval": self._aiying_interval,
+            "aiying_max_eps": self._aiying_max_eps,
         })
 
     def get_state(self) -> bool:
@@ -444,7 +957,8 @@ class LackEpisodeAutoSub(_PluginBase):
         return []
 
     def stop_service(self):
-        """停止一次性任务的本地调度器（cron 服务由 MP 托管，无需处理）"""
+        """停止一次性任务的本地调度器（cron 服务由 MP 托管，无需处理）；
+        同时优雅关闭爱影 TG 会话（下次使用自动重建连接）"""
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
@@ -455,6 +969,13 @@ class LackEpisodeAutoSub(_PluginBase):
                 self._scheduler = None
         except Exception as e:
             logger.error(f"【{self.plugin_name}】停止服务出错: {e}")
+        # 优雅关闭 TG 会话管理器（Telethon 未装/未初始化时静默跳过）
+        try:
+            mgr = _get_tg_manager()
+            if mgr:
+                mgr.shutdown()
+        except Exception:
+            pass
 
     # ==================================================================
     # 插件 API（_PluginBase 抽象方法，必须实现，否则插件加载失败）
@@ -464,6 +985,9 @@ class LackEpisodeAutoSub(_PluginBase):
         注册插件 API，挂载在 /api/v1/plugin/LackEpisodeAutoSub/ 下：
           GET /scan   手动触发一轮扫描（等价于「立即运行一次」），返回本轮摘要
           GET /status 查询当前统计（待验证/已核销/今日已订阅/今日配额等）
+          POST /tg_send_code 爱影115通道：发送 TG 登录验证码（body: {"phone": "+86..."}）
+          POST /tg_verify     爱影115通道：提交验证码完成登录（body: {"phone", "code", "password"?}）
+          GET /tg_status      爱影115通道：查询 TG 登录状态
         鉴权方式 apikey：调用时带 ?apikey=你的MP_API_TOKEN
         """
         return [
@@ -483,6 +1007,32 @@ class LackEpisodeAutoSub(_PluginBase):
                 "auth": "apikey",
                 "summary": "查询插件当前状态",
                 "description": "返回统计信息：待验证数/已核销数/超时未补齐数/今日已订阅数/今日配额等",
+            },
+            {
+                "path": "/tg_send_code",
+                "endpoint": self.api_tg_send_code,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "发送 TG 登录验证码",
+                "description": "爱影115通道登录第一步：body 传 {\"phone\": \"+86...\"}，"
+                               "验证码发到 TG 内「Telegram」官方会话（不是短信）",
+            },
+            {
+                "path": "/tg_verify",
+                "endpoint": self.api_tg_verify,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "提交验证码完成 TG 登录",
+                "description": "爱影115通道登录第二步：body 传 {\"phone\", \"code\", \"password\"(可空)}；"
+                               "账号开两步验证时必须带 password",
+            },
+            {
+                "path": "/tg_status",
+                "endpoint": self.api_tg_status,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "查询 TG 登录状态",
+                "description": "返回 {logged_in, username, phone}；未登录时先去配置页或调 /tg_send_code",
             },
         ]
 
@@ -540,6 +1090,96 @@ class LackEpisodeAutoSub(_PluginBase):
             }
         except Exception as e:
             logger.error(f"【{self.plugin_name}】API 查询状态失败: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # FastAPI Body 参数（导入失败时退化为普通默认参数，查询字符串也能传）
+    _BODY_STR = Body(default="", embed=True) if Body else ""
+
+    def api_tg_send_code(self, phone: str = _BODY_STR) -> Dict[str, Any]:
+        """API 端点：爱影115通道登录第一步，发送 TG 验证码"""
+        try:
+            phone = (phone or "").strip() or self._tg_phone
+            if not phone:
+                return {"success": False,
+                        "message": "请提供手机号（body 传 phone，或在配置页填 TG 手机号）",
+                        "data": None}
+            mgr = self.__get_tg()
+            if not mgr:
+                return {"success": False,
+                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "data": None}
+            res = mgr.send_code(phone)
+            if res.get("ok"):
+                self._tg_phone = phone
+                logger.info(f"【{self.plugin_name}】TG 验证码已发送至 {phone}")
+                return {"success": True,
+                        "message": "验证码已发送，请到 TG 内「Telegram」官方会话查看（不是短信），"
+                                   "然后调 /tg_verify 或在配置页勾「完成登录」",
+                        "data": None}
+            logger.error(f"【{self.plugin_name}】TG 发送验证码失败: {res.get('error')}")
+            return {"success": False,
+                    "message": f"发送失败: {res.get('error')}", "data": None}
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】API 发送验证码失败: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def api_tg_verify(self, phone: str = _BODY_STR, code: str = _BODY_STR,
+                      password: str = _BODY_STR) -> Dict[str, Any]:
+        """API 端点：爱影115通道登录第二步，提交验证码（可选两步验证密码）"""
+        try:
+            phone = (phone or "").strip() or self._tg_phone
+            code = (code or "").strip() or self._tg_code
+            password = password or self._tg_password
+            if not phone or not code:
+                return {"success": False,
+                        "message": "请提供 phone 与 code（先调 /tg_send_code）",
+                        "data": None}
+            mgr = self.__get_tg()
+            if not mgr:
+                return {"success": False,
+                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "data": None}
+            res = mgr.verify(phone, code, password)
+            if res.get("ok"):
+                self.__persist_tg_login(res)
+                # 验证码一次性使用，成功后清空
+                self._tg_code = ""
+                logger.info(f"【{self.plugin_name}】TG 登录成功: "
+                            f"{res.get('first_name')} (@{res.get('username')})")
+                return {"success": True,
+                        "message": f"登录成功：{res.get('first_name')} (@{res.get('username')})",
+                        "data": res}
+            logger.error(f"【{self.plugin_name}】TG 登录失败: {res.get('error')}")
+            return {"success": False,
+                    "message": f"登录失败: {res.get('error')}", "data": None}
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】API 登录验证失败: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def api_tg_status(self) -> Dict[str, Any]:
+        """API 端点：查询 TG 登录状态（实时查询并刷新缓存）"""
+        try:
+            mgr = self.__get_tg()
+            if not mgr:
+                # telethon 未装：返回缓存状态 + 提示
+                cached = self.get_data(self._DATA_TG_LOGIN) or {}
+                return {"success": False,
+                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "data": {"logged_in": bool(cached.get("logged_in")),
+                                 "username": cached.get("username", ""),
+                                 "phone": cached.get("phone", "")}}
+            res = mgr.status()
+            if res.get("ok"):
+                self.__persist_tg_login(res)
+                return {"success": True, "message": "",
+                        "data": {"logged_in": bool(res.get("logged_in")),
+                                 "username": res.get("username", ""),
+                                 "first_name": res.get("first_name", ""),
+                                 "phone": res.get("phone", "")}}
+            return {"success": False,
+                    "message": res.get("error", "查询失败"), "data": None}
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】API 查询 TG 状态失败: {e}")
             return {"success": False, "message": str(e), "data": None}
 
     # ==================================================================
@@ -640,6 +1280,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "skipped": 0,                    # 本轮跳过部数
             "failed": 0,                     # 本轮失败部数
             "sub_done": 0,                   # 订阅阶段已处理候选数
+            "aiying": 0,                     # 本轮爱影115通道补齐部数（v1.4.0）
             "current": "",                   # 当前正在处理的剧名
             "quota_left": remaining_quota,   # 当日剩余配额
             "percent": 0,
@@ -833,6 +1474,20 @@ class LackEpisodeAutoSub(_PluginBase):
         # ---------- 3.3 优先级排序 ----------
         candidates = self.__sort_candidates(candidates)
 
+        # ---------- 3.3.1 爱影115通道可用性检查（v1.4.0，每轮只查一次 TG 状态） ----------
+        aiying_usable = False
+        if not self._dry_run:
+            try:
+                aiying_usable = self.__aiying_ready()
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】爱影通道检测异常（不影响 PT 订阅）: {e}")
+                aiying_usable = False
+        if aiying_usable:
+            logger.info(f"【{self.plugin_name}】爱影115通道已启用，缺集将优先尝试 115 离线")
+        aiying_clicks = 0        # 本轮爱影累计点击数（熔断用，上限 100）
+        aiying_round = 0         # 本轮爱影补齐剧数
+        aiying_fuse_logged = False  # 熔断提示是否已记录
+
         # ---------- 3.4 按配额 + 风控订阅 ----------
         # 进度切换到订阅阶段，并明确打印配额（之前没有这行，看起来像"卡住没订阅"）
         progress.update({
@@ -873,10 +1528,16 @@ class LackEpisodeAutoSub(_PluginBase):
 
             # 调试模式：只记录，不订阅、不消耗配额、不标记已处理、不进入验证回环
             if self._dry_run:
+                dry_msg = "调试模式未真正订阅"
+                if self._aiying_enabled and self._sa_bot:
+                    # 调试下不发任何 TG 消息，只记录爱影将尝试的集数
+                    dry_try = min(cand["missing"], self._aiying_max_eps)
+                    logger.info(f"【{title}】[调试] 爱影将尝试 {dry_try} 集")
+                    dry_msg += f"；爱影将尝试 {dry_try} 集"
                 self.__append_history(
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
-                    result="调试-待订阅", message="调试模式未真正订阅")
+                    result="调试-待订阅", message=dry_msg)
                 progress["sub_done"] = index + 1
                 progress["percent"] = self.__calc_percent(progress)
                 self.__save_progress(progress)
@@ -888,9 +1549,58 @@ class LackEpisodeAutoSub(_PluginBase):
                             f"【{title}】及之后候选留待下一轮")
                 break
 
-            # 逐季添加订阅（MP 订阅后自己会比对媒体库只补缺集）
-            ok, msg = self.__subscribe_show(
-                title, cand["year"], cand["tmdbid"], cand["lack_info"])
+            # ---------- 爱影115通道（v1.4.0）：MP 订阅之前优先尝试 ----------
+            channel = "pt"   # pt / aiying / mixed
+            ok, msg = False, ""
+            ay = None
+            if aiying_usable:
+                # 【风控】单轮爱影总点击数熔断：超过 100 次本轮停止使用爱影，剩余走 PT
+                if aiying_clicks >= 100:
+                    if not aiying_fuse_logged:
+                        aiying_fuse_logged = True
+                        logger.warning(f"【{self.plugin_name}】爱影本轮点击已达 100 次上限，"
+                                       f"触发熔断，剩余候选全部转 PT 订阅")
+                        self.__append_history(
+                            history, title="（系统）", year="", tmdbid=0, lack_info={},
+                            missing_count=0, result="爱影熔断",
+                            message="本轮爱影点击超过 100 次，剩余候选转 PT")
+                else:
+                    try:
+                        ay = self.__aiying_fill(cand, 100 - aiying_clicks)
+                        if ay:
+                            aiying_clicks += ay.get("clicks", 0)
+                    except Exception as e:
+                        logger.error(f"【{title}】爱影通道异常（静默转 PT 兜底）: {e}")
+                        ay = None
+
+            if ay and ay.get("status") == "all":
+                # 全部缺集都经 115 拿到：不再调 __subscribe_show
+                ok, channel = True, "aiying"
+                aiying_round += 1
+                msg = f"[爱影115] 已提交 {ay['got']} 集到 115 离线"
+                if ay.get("quota_left") is not None:
+                    msg += f"（本月剩余次数 {ay['quota_left']}）"
+            elif ay and ay.get("status") == "partial":
+                # 部分集拿到：拿不到的集仍走 MP 订阅（MP 会自己比对只补缺集）
+                ok_pt, msg_pt = self.__subscribe_show(
+                    title, cand["year"], cand["tmdbid"], cand["lack_info"])
+                ok, channel = True, "mixed"
+                aiying_round += 1
+                msg = (f"[爱影115] {ay['got']} 集已提交 115；"
+                       f"剩余 {cand['missing'] - ay['got']} 集转 PT：{msg_pt}")
+                if not ok_pt:
+                    logger.warning(f"【{title}】爱影已补 {ay['got']} 集，"
+                                   f"剩余集 PT 订阅未成功: {msg_pt}")
+            else:
+                # 爱影完全没资源/超时/异常：静默落到 MP 订阅（PT 兜底）
+                prefix = ""
+                if aiying_usable and aiying_clicks < 100:
+                    prefix = ("爱影无资源，转 PT：" if ay is not None
+                              else "爱影通道异常，转 PT：")
+                # 逐季添加订阅（MP 订阅后自己会比对媒体库只补缺集）
+                ok, msg_pt = self.__subscribe_show(
+                    title, cand["year"], cand["tmdbid"], cand["lack_info"])
+                msg = prefix + (msg_pt or "")
 
             # 【风控】订阅间隔：无论成败都 sleep，避免瞬间打爆 MP/TMDB/PT 站
             if self._subscribe_interval > 0:
@@ -901,12 +1611,16 @@ class LackEpisodeAutoSub(_PluginBase):
                 consecutive_failures = 0  # 成功一次，连续失败清零
                 remaining_quota -= 1
                 progress["subscribed"] = subscribed
+                progress["aiying"] = aiying_round
                 progress["sub_done"] = index + 1
                 progress["quota_left"] = remaining_quota
                 progress["percent"] = self.__calc_percent(progress)
                 self.__save_progress(progress)
                 self.__incr_daily_quota()
-                subscribed_titles.append(f"{title}（缺 {cand['missing']} 集）")
+                # 通知里区分来源渠道
+                channel_tag = {"aiying": "[爱影115]", "mixed": "[爱影+PT]"}.get(
+                    channel, "[PT下载]")
+                subscribed_titles.append(f"{channel_tag} {title}（缺 {cand['missing']} 集）")
                 # 标记已处理，下一轮不再重复
                 processed[str(cand["tmdbid"])] = {
                     "title": title,
@@ -915,7 +1629,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     "seasons": sorted(cand["lack_info"].keys()),
                 }
                 # 【验证回环】登记"已订阅未核销"快照，之后每轮复查入库情况
-                self.__register_pending(cand)
+                self.__register_pending(cand, channel=channel)
                 self.__append_history(
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
@@ -950,6 +1664,8 @@ class LackEpisodeAutoSub(_PluginBase):
         stats["total_subscribed"] = stats.get("total_subscribed", 0) + subscribed
         stats["total_skipped"] = stats.get("total_skipped", 0) + skipped
         stats["total_failed"] = stats.get("total_failed", 0) + failed
+        stats["total_aiying"] = stats.get("total_aiying", 0) + aiying_round  # 累计爱影补齐
+        stats["last_aiying"] = aiying_round                                  # 本轮爱影补齐
         stats["last_run"] = start_time.strftime(TIME_FMT)
 
         self.save_data(self._DATA_PROCESSED, processed)
@@ -965,6 +1681,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "scanned": scanned, "missing": missing_shows,
             "candidates": len(candidates), "subscribed": subscribed,
             "skipped": skipped, "failed": failed,
+            "aiying": aiying_round,
             "current": "", "quota_left": remaining_quota,
             "percent": 100,
             "finished_at": datetime.datetime.now(
@@ -996,10 +1713,12 @@ class LackEpisodeAutoSub(_PluginBase):
     # ==================================================================
     # 下载验证回环 0：订阅后入库验证
     # ==================================================================
-    def __register_pending(self, cand: Dict[str, Any]):
-        """订阅成功后登记快照：之后每轮复查 Emby 是否真入库"""
+    def __register_pending(self, cand: Dict[str, Any], channel: str = "pt"):
+        """订阅成功后登记快照：之后每轮复查 Emby 是否真入库。
+        channel：补齐渠道（pt=纯 PT 订阅 / aiying=纯爱影115 / mixed=爱影+PT 混合），
+        v1.4.0 新增，核销时 115 渠道会退订本插件此前添加的 PT 订阅"""
         pending: Dict[str, Any] = self.get_data(self._DATA_PENDING) or {}
-        # 快照内容：tmdbid、剧名、年份、缺集列表、订阅时间、Emby 定位信息
+        # 快照内容：tmdbid、剧名、年份、缺集列表、订阅时间、Emby 定位信息、渠道
         pending[str(cand["tmdbid"])] = {
             "title": cand["title"],
             "year": cand["year"],
@@ -1008,6 +1727,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "item_id": cand["item_id"],      # Emby 剧集 ID（复查时直接定位）
             "seasons": {str(s): list(eps) for s, eps in cand["lack_info"].items()},
             "remaining": {str(s): list(eps) for s, eps in cand["lack_info"].items()},
+            "channel": channel,              # 补齐渠道（v1.4.0）
             "subscribe_time": datetime.datetime.now(
                 tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
             "alerted": False,                # 是否已发过"超时未补齐"告警（只告警一次）
@@ -1085,6 +1805,11 @@ class LackEpisodeAutoSub(_PluginBase):
                     tmdbid=int(entry.get("tmdbid") or 0), lack_info={},
                     missing_count=0, result="已补齐核销",
                     message=f"订阅后第 {wait_days} 天确认全部入库")
+                # v1.4.0：115 渠道补齐的剧，退订本插件此前添加的 PT 订阅，避免重复下载
+                try:
+                    self.__unsub_pt_if_115(entry, title, history)
+                except Exception as e:
+                    logger.error(f"【{title}】退订 PT 订阅检查失败（不影响核销）: {e}")
             elif status == "timeout" and not entry.get("alerted"):
                 # 超时未补齐 -> 告警一次（不自动退订，只提醒）
                 entry["remaining"] = new_remaining
@@ -1645,6 +2370,266 @@ class LackEpisodeAutoSub(_PluginBase):
             logger.error(f"【{self.plugin_name}】发送汇总通知失败: {e}")
 
     # ==================================================================
+    # 爱影 115 通道（v1.4.0 新增）：TG 会话 / 登录 / 缺集补齐 / PT 退订
+    # ==================================================================
+    def __get_tg(self) -> Optional[_AiyingTgManager]:
+        """获取 TG 会话管理器并按当前配置初始化；Telethon 未安装时返回 None"""
+        mgr = _get_tg_manager()
+        if not mgr:
+            return None
+        try:
+            mgr.configure(self.__tg_session_path(), self._tg_proxy)
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】TG 管理器配置失败: {e}")
+            return None
+        return mgr
+
+    def __tg_session_path(self) -> str:
+        """TG 会话文件路径：优先插件数据目录（get_data_path），兜底固定路径"""
+        try:
+            return str(self.get_data_path() / "aiying.session")
+        except Exception:
+            return "/config/plugins/lackepisodeautosub/aiying.session"
+
+    def __persist_tg_login(self, info: Dict[str, Any]):
+        """持久化 TG 登录状态（详情页/状态 API 展示用）"""
+        try:
+            self.save_data(self._DATA_TG_LOGIN, {
+                "logged_in": bool(info.get("logged_in")),
+                "username": info.get("username", ""),
+                "first_name": info.get("first_name", ""),
+                "phone": info.get("phone", ""),
+                "checked_at": datetime.datetime.now(
+                    tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+            })
+        except Exception as e:
+            logger.debug(f"【{self.plugin_name}】保存 TG 登录状态失败: {e}")
+
+    def __handle_tg_login_actions(self):
+        """
+        处理配置页的两个一次性开关（保存配置即触发，结果写日志与详情页状态区）：
+          tg_send_code_once：给 _tg_phone 发送验证码
+          tg_verify_once   ：用 _tg_code（+_tg_password）完成登录
+        处理完复位开关并回写配置（否则每次保存都会重复触发）。
+        """
+        mgr = self.__get_tg()
+        if not mgr:
+            logger.warning(f"【{self.plugin_name}】telethon 未安装，无法执行 TG 登录动作"
+                           f"（请确认插件目录 requirements.txt 依赖已安装）")
+            self._tg_send_code_once = False
+            self._tg_verify_once = False
+            self._tg_code = ""
+            self.__update_config()
+            return
+
+        changed = False
+        if self._tg_send_code_once:
+            if not self._tg_phone:
+                logger.warning(f"【{self.plugin_name}】请先填写 TG 手机号再发送验证码")
+            else:
+                res = mgr.send_code(self._tg_phone)
+                if res.get("ok"):
+                    logger.info(f"【{self.plugin_name}】TG 验证码已发送至 {self._tg_phone}，"
+                                f"请到 TG 内「Telegram」官方会话查看（不是短信），"
+                                f"然后填验证码并勾「完成登录」再保存一次")
+                else:
+                    logger.error(f"【{self.plugin_name}】TG 发送验证码失败: {res.get('error')}")
+            self._tg_send_code_once = False
+            changed = True
+
+        if self._tg_verify_once:
+            if not self._tg_phone or not self._tg_code:
+                logger.warning(f"【{self.plugin_name}】请先填写手机号与验证码再完成登录")
+            else:
+                res = mgr.verify(self._tg_phone, self._tg_code, self._tg_password)
+                if res.get("ok"):
+                    self.__persist_tg_login(res)
+                    logger.info(f"【{self.plugin_name}】TG 登录成功: "
+                                f"{res.get('first_name')} (@{res.get('username')})")
+                else:
+                    logger.error(f"【{self.plugin_name}】TG 登录失败: {res.get('error')}")
+            self._tg_verify_once = False
+            self._tg_code = ""   # 验证码一次性使用，保存后清空
+            changed = True
+
+        if changed:
+            self.__update_config()
+
+    def __aiying_ready(self) -> bool:
+        """
+        爱影通道是否可用：开关开 + telethon 可用 + TG 已登录 + SA 机器人已配置。
+        任何一步不满足都返回 False，调用方静默落 PT 兜底。
+        """
+        if not self._aiying_enabled:
+            return False
+        if not _TG_LIB_OK:
+            logger.warning(f"【{self.plugin_name}】telethon 未安装，爱影通道不可用"
+                           f"（PT 订阅不受影响）")
+            return False
+        if not self._sa_bot:
+            logger.warning(f"【{self.plugin_name}】爱影通道已开启但未配置 SA 转存机器人，"
+                           f"本轮跳过爱影（PT 兜底）")
+            return False
+        mgr = self.__get_tg()
+        if not mgr:
+            return False
+        st = mgr.status()
+        if st.get("logged_in"):
+            self.__persist_tg_login(st)
+            return True
+        logger.warning(f"【{self.plugin_name}】TG 未登录（{st.get('error') or '会话失效'}），"
+                       f"爱影通道不可用，请到配置页完成登录")
+        self.__persist_tg_login({"logged_in": False})
+        return False
+
+    def __aiying_fill(self, cand: Dict[str, Any],
+                      click_budget_left: int) -> Optional[Dict[str, Any]]:
+        """
+        爱影115通道尝试补齐一部剧（同步方法，内部经 TG 管理器提交协程）。
+        返回 None 表示通道异常（调用方静默落 PT）；否则返回：
+          {"status": "all"/"partial"/"none", "got": 成功集数, "clicks": 点击数,
+           "quota_left": 爱影本月剩余次数, "sa_failed": [失败集标签]}
+        """
+        mgr = self.__get_tg()
+        if not mgr:
+            return None
+        title = cand["title"]
+        tmdbid = int(cand["tmdbid"])
+        # 缺集集合 {(季, 集)}
+        lack_eps = {(int(s), int(e))
+                    for s, eps in cand["lack_info"].items() for e in eps}
+        # 【风控】每剧经此通道最多补 _aiying_max_eps 集，超出部分留给 PT
+        if len(lack_eps) > self._aiying_max_eps:
+            logger.info(f"【{title}】缺集 {len(lack_eps)} 集超过爱影单剧上限 "
+                        f"{self._aiying_max_eps}，仅尝试前 {self._aiying_max_eps} 集，"
+                        f"剩余转 PT")
+            lack_try = set(sorted(lack_eps)[:self._aiying_max_eps])
+        else:
+            lack_try = lack_eps
+
+        # 搜索关键词：有年份发「剧名 年份」，否则发 tmdbid（机器人支持 tmdbid）
+        keyword = f"{title} {cand['year']}".strip() if cand.get("year") else str(tmdbid)
+        logger.info(f"【{title}】爱影通道：向 @{self._aiying_bot} 查询「{keyword}」，"
+                    f"缺集 {len(lack_try)} 集")
+
+        res = mgr.collect(self._aiying_bot, keyword, tmdbid, lack_try,
+                          max_pages=5, interval=self._aiying_interval,
+                          click_budget=max(1, click_budget_left))
+        # 剧名+年份没搜到资源时，用 tmdbid 兜底再试一次
+        if res.get("ok") and not (res.get("links") or {}) and keyword != str(tmdbid):
+            logger.info(f"【{title}】按剧名未找到缺集资源，改用 tmdbid={tmdbid} 再试")
+            res2 = mgr.collect(self._aiying_bot, str(tmdbid), tmdbid, lack_try,
+                               max_pages=5, interval=self._aiying_interval,
+                               click_budget=max(1, click_budget_left
+                                                - int(res.get("clicks", 0))))
+            if res2.get("ok"):
+                res2["clicks"] = int(res2.get("clicks", 0)) + int(res.get("clicks", 0))
+                if res2.get("quota_left") is None:
+                    res2["quota_left"] = res.get("quota_left")
+                res = res2
+
+        if not res.get("ok"):
+            logger.info(f"【{title}】爱影查询失败：{res.get('error')}（转 PT）")
+            return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
+                    "quota_left": None, "sa_failed": []}
+
+        # 持久化爱影本月剩余次数（详情页展示）
+        if res.get("quota_left") is not None:
+            try:
+                self.save_data(self._DATA_AIYING, {
+                    "quota_left": res["quota_left"],
+                    "updated": datetime.datetime.now(
+                        tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+                })
+            except Exception:
+                pass
+
+        links: Dict[Tuple[int, int], str] = res.get("links") or {}
+        if not links:
+            logger.info(f"【{title}】爱影无本剧缺集资源（转 PT）")
+            return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
+                    "quota_left": res.get("quota_left"), "sa_failed": []}
+
+        # 把拿到的 ed2k/115 链接逐条发给 SA 转存机器人
+        items = [(f"S{s:02d}E{e:02d}", url) for (s, e), url in sorted(links.items())]
+        logger.info(f"【{title}】爱影拿到 {len(items)} 集链接，逐条转发给 "
+                    f"@{self._sa_bot} 离线到 115")
+        sub = mgr.submit(self._sa_bot, items, interval=self._aiying_interval)
+        if not sub.get("ok"):
+            logger.error(f"【{title}】SA 转存提交异常：{sub.get('error')}（已拿到的集按失败处理，转 PT）")
+            return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
+                    "quota_left": res.get("quota_left"), "sa_failed": []}
+
+        results = sub.get("results") or {}
+        ok_eps = {(s, e) for (s, e) in links
+                  if (results.get(f"S{s:02d}E{e:02d}") or {}).get("ok")}
+        sa_failed = [label for label, r in results.items() if not r.get("ok")]
+        got = len(ok_eps)
+        for label in sa_failed:
+            logger.warning(f"【{title}】{label} SA 转存失败: "
+                           f"{(results.get(label) or {}).get('msg', '')}")
+
+        if ok_eps >= lack_eps:
+            status = "all"
+        elif got > 0:
+            status = "partial"
+        else:
+            status = "none"
+        logger.info(f"【{title}】爱影通道结果：{status}（成功 {got} / 缺集 "
+                    f"{len(lack_eps)} 集，点击 {res.get('clicks', 0)} 次）")
+        return {"status": status, "got": got, "clicks": int(res.get("clicks", 0)),
+                "quota_left": res.get("quota_left"), "sa_failed": sa_failed}
+
+    def __unsub_pt_if_115(self, entry: Dict[str, Any], title: str,
+                          history: List[Dict[str, Any]]):
+        """
+        核销时调用：channel 含 115 渠道的剧，若本插件此前给它加过 MP PT 订阅，
+        核销后自动删除该订阅（115 已补齐，避免 PT 重复下载）。
+        只删除本插件自己添加的订阅（username=插件名），用户手动订阅不动。
+        """
+        channel = entry.get("channel", "pt")
+        if channel not in ("aiying", "mixed"):
+            return
+        try:
+            tmdbid = int(entry.get("tmdbid") or 0)
+        except (TypeError, ValueError):
+            return
+        if not tmdbid:
+            return
+        seasons: List[int] = []
+        for s in (entry.get("seasons") or {}).keys():
+            try:
+                seasons.append(int(s))
+            except (TypeError, ValueError):
+                continue
+
+        removed = 0
+        for season in seasons:
+            try:
+                if not self._subOper.exists(tmdbid, None, season=season):
+                    continue
+                # 只删本插件自己加的订阅，避免误删用户手动订阅
+                my_subs = [sub for sub in
+                           (self._subOper.list_by_username(self.plugin_name) or [])
+                           if getattr(sub, "tmdbid", None) == tmdbid
+                           and getattr(sub, "season", None) == season]
+                if not my_subs:
+                    logger.info(f"【{title}】第 {season} 季存在 PT 订阅但非本插件添加，保留不动")
+                    continue
+                for sub in my_subs:
+                    self._subOper.delete(sub.id)
+                    removed += 1
+                    logger.info(f"【{title}】第 {season} 季 PT 订阅已退订 (sid={sub.id})")
+            except Exception as e:
+                logger.error(f"【{title}】第 {season} 季退订 PT 失败: {e}")
+        if removed:
+            logger.info(f"【{title}】115 已补齐，退订 PT 订阅 {removed} 季")
+            self.__append_history(
+                history, title=title, year=str(entry.get("year", "")),
+                tmdbid=tmdbid, lack_info={}, missing_count=0,
+                result="退订PT", message=f"115 已补齐，退订 PT 订阅 {removed} 季")
+
+    # ==================================================================
     # 配置表单 / 详情页
     # ==================================================================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -1994,6 +2979,183 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
+                    # ---- 第十行：爱影115通道说明 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [{
+                                    'component': 'VAlert',
+                                    'props': {
+                                        'type': 'warning',
+                                        'variant': 'tonal',
+                                        'text': '【爱影115通道】（实验功能）开启后，缺集会先问爱影资源机器人'
+                                                '拿 ed2k/115 链接，发给你的 SA 转存机器人自动离线到 115；'
+                                                '拿不到的集仍走原有 PT 订阅兜底。'
+                                                '需要：①你的 TG 账号完成下方登录；②填写你自己的 Symedia '
+                                                '转存机器人（Symedia 转存助手配置见 symedia.top 文档）。'
+                                                'Telethon 依赖未装上或 TG 未登录时，本通道自动停用，'
+                                                '不影响原有 PT 订阅。'
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行：爱影开关 + 机器人配置 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'aiying_enabled',
+                                              'label': '启用爱影115通道',
+                                              'hint': '缺集优先走 115 离线，拿不到再落 PT 兜底',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_bot',
+                                              'label': '爱影资源机器人用户名',
+                                              'placeholder': 'ayclub_bot',
+                                              'hint': '默认 ayclub_bot，不用改；不带 @',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_bot',
+                                              'label': 'SA 转存机器人用户名（你自己的，不带 @）',
+                                              'placeholder': '例如 ColdSymMedia_bot',
+                                              'hint': '填你自己 Symedia 的 TG 机器人；插件把 115/ed2k 链接发给它自动离线到 115。Symedia 转存助手配置见 symedia.top 文档',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十二行：TG 登录信息 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'tg_phone',
+                                              'label': 'TG 手机号（带国家区号）',
+                                              'placeholder': '+8613800138000',
+                                              'hint': '登录你本人 TG 账号，会话文件只存在你自己 NAS 的插件数据目录里',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'tg_code',
+                                              'label': 'TG 验证码（一次性，保存后清空）',
+                                              'placeholder': '12345',
+                                              'hint': '先勾「发送验证码」保存一次，到 TG 的「Telegram」官方会话里收码（不是短信），填到这里再勾「完成登录」保存',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'tg_password',
+                                              'label': '两步验证密码（可空）',
+                                              'type': 'password',
+                                              'hint': 'TG 账号开了两步验证才需要填',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十三行：登录动作开关 + 代理 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'tg_send_code_once',
+                                              'label': '发送验证码（保存即触发）',
+                                              'hint': '一次性开关：填好手机号后勾上并保存，结果看日志',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'tg_verify_once',
+                                              'label': '完成登录（保存即触发）',
+                                              'hint': '一次性开关：填好验证码后勾上并保存，登录状态看详情页顶部',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'tg_proxy',
+                                              'label': 'TG 代理地址',
+                                              'placeholder': TG_DEFAULT_PROXY,
+                                              'hint': 'Telegram 需要代理才能连；也可以调 API 登录：POST /api/v1/plugin/LackEpisodeAutoSub/tg_send_code 与 /tg_verify（见 /docs）',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十四行：爱影风控参数 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_interval',
+                                              'label': '爱影每集间隔（秒）',
+                                              'type': 'number', 'placeholder': '3',
+                                              'hint': '点按钮/发链接的间隔，太小容易被 TG 风控',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_max_eps',
+                                              'label': '每剧经爱影最多补集数',
+                                              'type': 'number', 'placeholder': '30',
+                                              'hint': '防点爆爱影次数；超出的集仍走 PT 订阅',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
                     # ---- 提示 ----
                     {
                         'component': 'VRow',
@@ -2049,6 +3211,17 @@ class LackEpisodeAutoSub(_PluginBase):
             "dead_task_auto_delete": False,
             "disk_check_path": "/video/downloads",
             "disk_alert_gb": 200,
+            "aiying_enabled": False,
+            "tg_phone": "",
+            "tg_code": "",
+            "tg_password": "",
+            "tg_proxy": TG_DEFAULT_PROXY,
+            "tg_send_code_once": False,
+            "tg_verify_once": False,
+            "aiying_bot": "ayclub_bot",
+            "sa_bot": "",
+            "aiying_interval": 3,
+            "aiying_max_eps": 30,
         }
 
     def get_page(self) -> List[dict]:
@@ -2136,6 +3309,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                      'text': (f"本轮实时：发现缺集 {progress_data.get('missing', 0)} 部 · "
                                               f"候选 {progress_data.get('candidates', 0)} 部 · "
                                               f"已订阅 {progress_data.get('subscribed', 0)} 部 · "
+                                              f"爱影补齐 {progress_data.get('aiying', 0)} 部 · "
                                               f"跳过 {progress_data.get('skipped', 0)} 部 · "
                                               f"失败 {progress_data.get('failed', 0)} 部 · "
                                               f"今日剩余配额 {progress_data.get('quota_left', 0)} 部")},
@@ -2172,7 +3346,48 @@ class LackEpisodeAutoSub(_PluginBase):
                 }]
             })
 
-        page = progress_rows + [
+        # ---- TG 登录状态行（v1.4.0）：爱影通道启用或登录过才显示 ----
+        tg_login = self.get_data(self._DATA_TG_LOGIN) or {}
+        tg_rows: List[dict] = []
+        if self._aiying_enabled or tg_login:
+            if tg_login.get("logged_in"):
+                _acc = (f"{tg_login.get('first_name', '')} "
+                        f"(@{tg_login.get('username', '')})").strip()
+                tg_rows.append({
+                    'component': 'VRow',
+                    'content': [{
+                        'component': 'VCol',
+                        'props': {'cols': 12},
+                        'content': [{
+                            'component': 'VAlert',
+                            'props': {
+                                'type': 'success', 'variant': 'tonal', 'density': 'compact',
+                                'text': (f"爱影115通道：TG 已登录（{_acc}）"
+                                         f"{'，通道已启用' if self._aiying_enabled else '，通道未启用（到配置页打开开关）'}"
+                                         f"（状态更新于 {tg_login.get('checked_at', '未知')}）")
+                            }
+                        }]
+                    }]
+                })
+            else:
+                tg_rows.append({
+                    'component': 'VRow',
+                    'content': [{
+                        'component': 'VCol',
+                        'props': {'cols': 12},
+                        'content': [{
+                            'component': 'VAlert',
+                            'props': {
+                                'type': 'warning', 'variant': 'tonal', 'density': 'compact',
+                                'text': ('爱影115通道：TG 未登录。请到配置页填手机号，'
+                                         '勾「发送验证码」保存，再到 TG 收码后填验证码、'
+                                         '勾「完成登录」保存；登录成功后本行会显示账号名。')
+                            }
+                        }]
+                    }]
+                })
+
+        page = tg_rows + progress_rows + [
             # ---- 统计卡片（两行：扫描订阅类 + 验证回环类） ----
             {
                 'component': 'VRow',
@@ -2193,6 +3408,18 @@ class LackEpisodeAutoSub(_PluginBase):
                     __stat_card("超时未补齐", stats.get("total_timeout", 0), "deep-orange"),
                 ]
             },
+            # ---- 爱影统计卡片（v1.4.0，通道启用才显示）----
+            *([{
+                'component': 'VRow',
+                'content': [
+                    __stat_card("本轮爱影补齐", stats.get("last_aiying", 0), "cyan"),
+                    __stat_card("累计爱影补齐", stats.get("total_aiying", 0), "teal"),
+                    __stat_card(
+                        "爱影剩余次数",
+                        (self.get_data(self._DATA_AIYING) or {}).get("quota_left", "未知"),
+                        "indigo"),
+                ]
+            }] if self._aiying_enabled else []),
             # ---- 上次运行时间 ----
             {
                 'component': 'VRow',
