@@ -22,6 +22,74 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.1  修复详情页表格显示 bug：MP 前端 v2.15.6 的 VDataTable 渲染
+          thead/tbody 全空（只剩分页器，后端 JSON 正常），「补齐验证/
+          疑似死任务/最近历史」三个表格全部改为裸 HTML 经 v-html 渲染；
+          状态列着色、渠道 chips 着色、单元格全量 HTML 转义
+  v1.9.0  四项优化：
+          ①爱影 API 选包改为「按缺集精确选包」的贪心集合覆盖：逐条解析资源
+            name/notes 的集数范围（S01E06-S01E10/S1-S5/单集/全集/无标识），
+            与缺集求交，无关包直接淘汰；每轮选新增有效覆盖最大的包，
+            平局按 115 分享链接优先 > 溢出更小 > size 更小；
+            缺 2 集不再拖回整季大包，选包理由写入 channel_detail/日志；
+          ②部分季订阅失败的首轮成功季纳入验证回环：__register_pending
+            支持按成功季登记与合并（同一部剧只占一条，剩余缺集并集更新）；
+          ③即时搜索触发前探 Emby 就绪（/emby/System/Info/Public，5 秒超时，
+            5 分钟 TTL 缓存，失败不缓存下条重探）：未就绪跳过触发，
+            避免 Emby 重启时 MP 误判整季缺失拖整季包（大明风华 131G 事故）；
+          ④/ay_api_test 增加 eps 参数模拟缺集，返回选包明细与理由
+  v1.8.0  SA 直连 HTTP 转存：
+          ①SA（Symedia）提交从「Telethon 发 TG 机器人」升级为 HTTP 直连
+            （SA 的消息 API 唯一被处理的形态是企业微信回调协议，已实现
+            WXBizMsgCrypt：AES-256-CBC + sha1 签名；明文 POST 会被 SA 静默
+            丢弃，「消息已接收」≠「消息处理成功」，后者才算成功）；
+          ②TG 会话从必需降级为可选兜底：SA HTTP 通道配置齐全时，
+            TG 未登录也能走「爱影 API 查询 → HTTP 转存」全链路；
+          ③新增包装层 __sa_submit：HTTP 优先、失败自动回退 TG 提交，
+            渠道明细人话区分 SA(HTTP)/SA(TG)；
+          ④提交不等离线结果（SA 异步处理），统一标「已提交待验证」，
+            由入库验证回环兜底确认（设计意图）；
+          ⑤新增联调 API GET /sa_http_test；api_status 增加 sa_channel 字段
+  v1.7.0  爱影 HTTP API 通道 + 渠道详情记录：
+          ①爱影查询从 TG 点按钮流升级为 HTTP API 主通道（POST /api/user，
+            返回 115 分享链接与当月额度 times），链接经现有 SA 通道（Telethon
+            发 SA 机器人）离线到 115；API 请求异常自动回退原 TG 点按钮流程，
+            API 明确无资源则直接转 PT 不再走 TG；
+          ②链接选择：优先整季整剧标识（全/Complete/S1-S5 等），其次按大小降序，
+            单剧最多提交 aiying_api_max_links 条；集数覆盖从 name/notes 尽力估算，
+            估不出写「覆盖未知，待入库验证」，真实补齐仍以验证回环为准；
+          ③历史记录扩展 channel（pt/aiying_api/aiying_tg/mixed）与 channel_detail
+            人话明细（PT 附 sid、115 附资源 notes/大小/SA 回执），汇总通知前缀
+            扩为 [PT]/[115·API]/[115·TG]/[混合]，详情页历史表新增渠道列；
+          ④新增插件 API GET /ay_api_test?tmdb_id=xx&save=0/1 用于联调测试；
+          ⑤页面统计区显示「爱影API剩余次数」（取最近一次响应 times）
+  v1.6.0  新增「增量扫描」（完结账本驱动）：
+          ①新增持久化「完结账本」done_ledger：只收录「TMDB 已完结(Ended/Canceled)
+            且当前无缺集」的剧；扫描评估无缺集时写入（status 取同一次识别结果，
+            不额外请求），验证回环核销已完结剧时也写入；
+          ②增量模式（默认开）下，账本内且不在待验证清单的剧本轮直接跳过，
+            不再逐部调 Emby/TMDB——几千部的大库一轮从 60~70 分钟降到几分钟；
+            判断只用 Emby 条目自带的 tmdbid，不为账本多调接口；
+          ③自愈：任何模式下发现「有缺集」或「订阅未全部成功」的剧自动移出账本，
+            完结剧出新季/用户删集下轮自动回归；
+          ④全量兜底：新增「每周全量扫描日」（默认周日）与「本轮强制全量扫描」
+            （一次性开关，跑完自动关）；「清空历史与已处理清单」连带清空账本；
+          ⑤进度与页面展示扫描模式/账本跳过部数/账本总量，汇总通知带「增量跳过 X 部」
+  v1.5.0  修复与闭环增强：
+          ①修复严重 bug：部分季订阅失败却整部销账（mixed 分支爱影部分成功也
+            抵消 PT 失败）——现在只有全部缺集季订阅成功才写已处理清单，
+            部分失败下轮重试，历史记录区分「已订阅/部分季订阅失败（附季号）」；
+          ②新增「订阅后立即搜索」（默认开）：订阅成功即触发 MP 单订阅即时搜索，
+            不再干等 MP 周期搜索（订阅间随机休眠 60~300 秒）；
+          ③修复验证回环与扫描阶段共用超时预算的问题：验证阶段独立计时，
+            预算仍取「单轮超时保护」配置值，两个阶段互不挤占；
+          ④修复「立即停止」死代码：扫描/订阅循环每轮检查 _event 停止标志，
+            置位时写「手动停止」历史记录并优雅收尾；
+          ⑤新增「超时自动重置订阅」（默认开，note 清空 + lack_episode 重置为
+            total_episode，让 MP 重新搜索）与「订阅丢失自动补订」（默认关，
+            尊重手动退订）；两者只处理 username=本插件名 的订阅；
+          ⑥页面修正：缺集统计卡标注「累计（含重复轮次）」口径、补齐验证表
+            状态列按已等天数实时计算超期、顶部加静态快照提示
   v1.4.0  新增「爱影 115 通道」（实验功能）：
           ①插件内嵌 TG 用户态会话管理器（Telethon + 独立 daemon 线程跑 asyncio
             事件循环，同步代码经 run_coroutine_threadsafe 调用），会话文件存插件
@@ -51,16 +119,22 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
   v1.1.0  新增优先级策略（地区/类型分层 + 排序规则）与风控三连
   v1.0.0  首版：Emby 缺集扫描 + 每日配额自动订阅
 """
+import base64
 import datetime
+import hashlib
 import os
+import random
 import re
+import struct
 import threading
 import time
 import traceback
 from threading import Event as ThreadEvent
 from typing import Any, Dict, List, Optional, Set, Tuple
+from html import escape as _escape_html
 
 import pytz
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -162,6 +236,15 @@ except Exception:
     SessionPasswordNeededError = Exception
     _TG_LIB_OK = False
 
+# pycryptodome 兜底导入（v1.8.0，SA HTTP 通道的企业微信回调加解密用）：
+# 依赖未装上时插件照常加载，SA HTTP 通道禁用并回退 TG 提交
+try:
+    from Crypto.Cipher import AES as _AES
+    _CRYPTO_OK = True
+except Exception:
+    _AES = None
+    _CRYPTO_OK = False
+
 
 def _parse_aiying_lines(text: str) -> List[Dict[str, Any]]:
     """
@@ -207,6 +290,49 @@ def _parse_aiying_lines(text: str) -> List[Dict[str, Any]]:
             "size": size_mb,
         })
     return entries
+
+
+def _html_table(headers: List[str], rows: List[List[Any]],
+                col_styles: Optional[Dict[int, str]] = None) -> str:
+    """
+    裸 HTML 表格渲染（v1.9.1）。
+    背景：MP 前端 v2.15.6 的 VDataTable 对本插件数据渲染 thead/tbody 全空
+    （只剩分页器，后端 JSON 完全正常），改用 {'component': 'div', 'html': ...}
+    的 v-html 通道绕过，这是最可靠的方式。
+    headers: 列名列表；rows: 单元格二维列表——单元格为 ("raw", html) 元组时
+    原样输出（用于状态着色/渠道 chips），其余一律 HTML 转义防注入；
+    col_styles: {列号: 追加的 td 样式}（如渠道详情列允许换行）。
+    纯函数，不依赖 MP 环境，可独立测试。
+    """
+    th_style = ("text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;"
+                "position:sticky;top:0;background:#fafafa;z-index:1")
+    td_style = "padding:5px 8px;border-bottom:1px solid #eee;vertical-align:top"
+    parts = [
+        '<div style="overflow-x:auto;max-height:560px;overflow-y:auto">',
+        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;'
+        'white-space:nowrap">',
+        '<thead><tr>',
+    ]
+    for h in headers:
+        parts.append(f'<th style="{th_style}">{_escape_html(str(h))}</th>')
+    parts.append('</tr></thead><tbody>')
+    if not rows:
+        # 空数据：跨列居中性冷淡灰
+        parts.append(f'<tr><td colspan="{len(headers)}" '
+                     'style="padding:16px 8px;text-align:center;color:#9e9e9e">'
+                     '暂无数据</td></tr>')
+    for row in rows:
+        parts.append('<tr>')
+        for idx, cell in enumerate(row):
+            extra = (col_styles or {}).get(idx, "")
+            style = td_style + (";" + extra if extra else "")
+            if isinstance(cell, tuple) and len(cell) == 2 and cell[0] == "raw":
+                parts.append(f'<td style="{style}">{cell[1]}</td>')
+            else:
+                parts.append(f'<td style="{style}">{_escape_html(str(cell))}</td>')
+        parts.append('</tr>')
+    parts.append('</tbody></table></div>')
+    return "".join(parts)
 
 
 class _AiyingTgManager:
@@ -300,6 +426,16 @@ class _AiyingTgManager:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def my_id(self) -> Dict[str, Any]:
+        """获取当前登录账号的 TG 用户 ID（v1.7.0，爱影 API 需要 tg_id）。
+        复用现有客户端连接，不单独建连；返回 {ok, tg_id, error}"""
+        if not _TG_LIB_OK:
+            return {"ok": False, "error": "telethon 未安装"}
+        try:
+            return self.__run(self.__my_id_async(), timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def shutdown(self):
         """优雅关闭：断开客户端并停止事件循环线程（下次使用自动重建）"""
         try:
@@ -380,6 +516,14 @@ class _AiyingTgManager:
             "first_name": getattr(me, "first_name", "") or "",
             "phone": getattr(me, "phone", "") or "",
         }
+
+    async def __my_id_async(self) -> Dict[str, Any]:
+        """在循环线程内取当前账号 get_me().id（复用已连接客户端）"""
+        client = await self.__ensure_client()
+        if not await client.is_user_authorized():
+            return {"ok": False, "error": "TG 未登录"}
+        me = await client.get_me()
+        return {"ok": True, "tg_id": getattr(me, "id", None)}
 
     async def __send_code_async(self, phone: str) -> Dict[str, Any]:
         client = await self.__ensure_client()
@@ -547,9 +691,17 @@ class _AiyingTgManager:
                 sent = await client.send_message(bot, url)
                 reply = await self.__wait_reply(client, bot, sent, timeout=30)
                 text = (reply.text or "") if reply else ""
-                # 「115离线下载失败：任务已存在」也算成功（说明 115 已有该文件）
-                if "失败" in text and "任务已存在" not in text:
-                    results[label] = {"ok": False, "msg": (text or "无回复")[:120]}
+                # 「任务已存在」和「你已经转存过该文件」都算成功（说明 115 已有该文件，无需再转 PT 重复下载）
+                # v1.8.1：打包链接的回执按行分析，全部失败行都是"已存在"类才算成功；
+                # 任何一行是「分享已取消」等真实失败则整条按失败处理（剩余集会转 PT 兜底）。
+                _already = ("任务已存在", "已经转存过")
+                if "失败" in text:
+                    fail_lines = [ln for ln in text.splitlines() if "=>" in ln]
+                    if fail_lines:
+                        _ok = all(any(h in ln for h in _already) for ln in fail_lines)
+                    else:
+                        _ok = any(h in text for h in _already)
+                    results[label] = {"ok": _ok, "msg": (text or "无回复")[:120]}
                 else:
                     results[label] = {"ok": True, "msg": text[:120]}
             except Exception as e:
@@ -583,7 +735,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.9.1"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -602,6 +754,9 @@ class LackEpisodeAutoSub(_PluginBase):
     # 立即停止一次性任务用的中断标志（注意必须用 threading 的 Event，
     # 不能与 app.core.event.Event 同名混淆）
     _event: ThreadEvent = ThreadEvent()
+    # Emby 就绪探测 TTL 缓存（v1.9.0）：{"ok": bool, "ts": 时间戳}，
+    # 5 分钟内不重复探测；探测失败不写入，下条触发前重探
+    _emby_ready_cache: Dict[str, Any] = {}
 
     # MP 功能链 / 操作类（init_plugin 时重建，热重载安全）
     _subChain: Optional[SubscribeChain] = None      # 订阅链：添加订阅
@@ -652,6 +807,16 @@ class LackEpisodeAutoSub(_PluginBase):
     _disk_check_path: str = "/video/downloads"  # 磁盘告警检查的容器内路径
     _disk_alert_gb: int = 200            # 剩余空间低于该 GB 数则告警
 
+    # 【订阅闭环增强】（v1.5.0 新增；老配置缺字段时默认值兜底，向后兼容）
+    _search_after_subscribe: bool = True   # 订阅成功后立即触发 MP 搜索该订阅
+    _verify_auto_reset: bool = True        # 超时未入库自动重置订阅（让 MP 重新搜索）
+    _verify_auto_resubscribe: bool = False # 订阅丢失自动补订（默认关，尊重手动退订）
+
+    # 【增量扫描】（v1.6.0 新增；老配置缺字段时默认值兜底，向后兼容）
+    _incremental_scan: bool = True         # 增量扫描：完结账本内的剧本轮跳过
+    _full_scan_weekday: int = 6            # 每周全量扫描日（0=周一 ... 6=周日，默认周日）
+    _full_scan_once: bool = False          # 本轮强制全量扫描（一次性，跑完自动关）
+
     # 【爱影 115 通道】（v1.4.0 新增；默认全部兜底，Telethon 缺失时整体不启用）
     _aiying_enabled: bool = False        # 爱影115通道开关
     _tg_phone: str = ""                  # TG 手机号（登录你本人 TG 账号）
@@ -665,6 +830,22 @@ class LackEpisodeAutoSub(_PluginBase):
     _aiying_interval: int = 3            # 每集点击/发送间隔秒数（风控）
     _aiying_max_eps: int = 30            # 每剧经此通道最多补集数（风控）
 
+    # 【爱影 HTTP API 通道】（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
+    _aiying_api_enabled: bool = True     # 爱影 API 通道（主通道，异常时回退 TG 流程）
+    _aiying_api_url: str = "http://api.ayclub.vip:5050/api/user"  # 爱影 API 地址
+    _aiying_api_token: str = "AY_66da220543a9400ea9ed9a368557d8c1"  # API token（用户自己的）
+    _aiying_api_max_links: int = 3       # 单剧最多提交分享链接数
+    _tg_id: str = ""                     # TG 用户 ID（API 需要；留空则从 TG 会话自动获取并缓存）
+
+    # 【SA HTTP 直连转存】（v1.8.0 新增；老配置缺字段时默认值兜底，向后兼容）
+    _sa_http_enabled: bool = True        # SA HTTP 通道总开关（False 或配置不齐则禁用回退 TG）
+    _sa_http_url: str = "http://192.168.31.40:8095/api/v1/message/"  # SA 消息 API（本地直连）
+    _sa_http_token: str = "VAVTzTajUU1c7xE6E"        # 企业微信回调 token（msg_signature 签名用）
+    _sa_http_aeskey: str = "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL"  # EncodingAESKey
+    _sa_http_corpid: str = "ww11ddefd6f7808c86"    # ToUserName/明文尾缀
+    _sa_http_userid: str = "8507302878"            # FromUserName（SA 不校验来源）
+    _sa_http_agentid: str = "1000003"              # AgentID（SA 不校验）
+
     # 持久化数据的 key
     _DATA_PROCESSED = "processed"        # 已处理（已成功订阅）的剧 {tmdbid: {...}}
     _DATA_HISTORY = "history"            # 运行历史列表（最多保留 200 条）
@@ -675,6 +856,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_PROGRESS = "progress"          # 本轮实时进度快照（详情页进度条 / API 轮询用）
     _DATA_TG_LOGIN = "tg_login"          # TG 登录状态缓存 {logged_in, username, phone, ...}
     _DATA_AIYING = "aiying"              # 爱影通道状态 {quota_left: 本月剩余次数, updated: 时间}
+    _DATA_DONELEDGER = "done_ledger"     # 完结账本（v1.6.0）：{tmdbid(str): {"title", "archived_at"}}
 
     # ==================================================================
     # 插件生命周期
@@ -710,8 +892,10 @@ class LackEpisodeAutoSub(_PluginBase):
                 self.save_data(self._DATA_PENDING, {})
                 self.save_data(self._DATA_DEAD, [])
                 self.save_data(self._DATA_PROGRESS, {})
+                # v1.6.0：完结账本一并清空，下一轮自然回到全量扫描
+                self.save_data(self._DATA_DONELEDGER, {})
                 self._clear_history = False
-                logger.info(f"【{self.plugin_name}】历史记录与已处理清单已清空")
+                logger.info(f"【{self.plugin_name}】历史记录、已处理清单与完结账本已清空")
                 self.__update_config()
 
             # 处理「爱影115通道」TG 登录一次性开关（发验证码/完成登录）
@@ -818,6 +1002,18 @@ class LackEpisodeAutoSub(_PluginBase):
             config.get("disk_check_path") or "/video/downloads").strip()
         self._disk_alert_gb = max(1, self.__to_int(config.get("disk_alert_gb"), 200))
 
+        # 订阅闭环增强（v1.5.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        self._search_after_subscribe = bool(config.get("search_after_subscribe", True))
+        self._verify_auto_reset = bool(config.get("verify_auto_reset", True))
+        self._verify_auto_resubscribe = bool(config.get("verify_auto_resubscribe", False))
+
+        # 增量扫描（v1.6.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        self._incremental_scan = bool(config.get("incremental_scan", True))
+        # 每周全量扫描日：0=周一 ... 6=周日，非法值收敛到 0-6
+        self._full_scan_weekday = min(6, max(0, self.__to_int(
+            config.get("full_scan_weekday"), 6)))
+        self._full_scan_once = bool(config.get("full_scan_once", False))
+
         # 爱影 115 通道（v1.4.0 新增；老配置缺字段时默认值兜底，向后兼容）
         self._aiying_enabled = bool(config.get("aiying_enabled", False))
         self._tg_phone = str(config.get("tg_phone") or "").strip()
@@ -830,6 +1026,35 @@ class LackEpisodeAutoSub(_PluginBase):
         self._sa_bot = str(config.get("sa_bot") or "").strip().lstrip("@")
         self._aiying_interval = max(1, self.__to_int(config.get("aiying_interval"), 3))
         self._aiying_max_eps = max(1, self.__to_int(config.get("aiying_max_eps"), 30))
+
+        # 爱影 HTTP API 通道（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        self._aiying_api_enabled = bool(config.get("aiying_api_enabled", True))
+        self._aiying_api_url = str(
+            config.get("aiying_api_url")
+            or "http://api.ayclub.vip:5050/api/user").strip()
+        self._aiying_api_token = str(
+            config.get("aiying_api_token")
+            or "AY_66da220543a9400ea9ed9a368557d8c1").strip()
+        self._aiying_api_max_links = max(
+            1, self.__to_int(config.get("aiying_api_max_links"), 3))
+        self._tg_id = str(config.get("tg_id") or "").strip()
+
+        # SA HTTP 直连转存（v1.8.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        self._sa_http_enabled = bool(config.get("sa_http_enabled", True))
+        self._sa_http_url = str(
+            config.get("sa_http_url")
+            or "http://192.168.31.40:8095/api/v1/message/").strip()
+        self._sa_http_token = str(
+            config.get("sa_http_token") or "VAVTzTajUU1c7xE6E").strip()
+        self._sa_http_aeskey = str(
+            config.get("sa_http_aeskey")
+            or "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL").strip()
+        self._sa_http_corpid = str(
+            config.get("sa_http_corpid") or "ww11ddefd6f7808c86").strip()
+        self._sa_http_userid = str(
+            config.get("sa_http_userid") or "8507302878").strip()
+        self._sa_http_agentid = str(
+            config.get("sa_http_agentid") or "1000003").strip()
 
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
@@ -914,6 +1139,12 @@ class LackEpisodeAutoSub(_PluginBase):
             "dead_task_auto_delete": self._dead_task_auto_delete,
             "disk_check_path": self._disk_check_path,
             "disk_alert_gb": self._disk_alert_gb,
+            "search_after_subscribe": self._search_after_subscribe,
+            "verify_auto_reset": self._verify_auto_reset,
+            "verify_auto_resubscribe": self._verify_auto_resubscribe,
+            "incremental_scan": self._incremental_scan,
+            "full_scan_weekday": self._full_scan_weekday,
+            "full_scan_once": self._full_scan_once,
             "aiying_enabled": self._aiying_enabled,
             "tg_phone": self._tg_phone,
             # 验证码为一次性输入，回写时清空，避免残留
@@ -926,6 +1157,18 @@ class LackEpisodeAutoSub(_PluginBase):
             "sa_bot": self._sa_bot,
             "aiying_interval": self._aiying_interval,
             "aiying_max_eps": self._aiying_max_eps,
+            "aiying_api_enabled": self._aiying_api_enabled,
+            "aiying_api_url": self._aiying_api_url,
+            "aiying_api_token": self._aiying_api_token,
+            "aiying_api_max_links": self._aiying_api_max_links,
+            "tg_id": self._tg_id,
+            "sa_http_enabled": self._sa_http_enabled,
+            "sa_http_url": self._sa_http_url,
+            "sa_http_token": self._sa_http_token,
+            "sa_http_aeskey": self._sa_http_aeskey,
+            "sa_http_corpid": self._sa_http_corpid,
+            "sa_http_userid": self._sa_http_userid,
+            "sa_http_agentid": self._sa_http_agentid,
         })
 
     def get_state(self) -> bool:
@@ -1034,6 +1277,25 @@ class LackEpisodeAutoSub(_PluginBase):
                 "summary": "查询 TG 登录状态",
                 "description": "返回 {logged_in, username, phone}；未登录时先去配置页或调 /tg_send_code",
             },
+            {
+                "path": "/ay_api_test",
+                "endpoint": self.api_ay_api_test,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "爱影 HTTP API 联调测试",
+                "description": "参数 tmdb_id（必填）+ save（0=只查询不提交，默认；1=查询并经 SA 提交第一条链接）"
+                               "+ eps（可选，模拟缺集如 1:6-10;2:1-3，返回选包明细与理由）。"
+                               "返回 http 状态/资源列表/选中链接/SA 回执/当前额度/tg_id 来源",
+            },
+            {
+                "path": "/sa_http_test",
+                "endpoint": self.api_sa_http_test,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "SA HTTP 直连联调测试",
+                "description": "参数 content（默认「获取当前用户 ID」）。用企业微信回调协议向 SA 发一条文本；"
+                               "返回「消息处理成功」即协议握手通过，命令执行结果看 SA 的通知渠道",
+            },
         ]
 
     def api_scan(self) -> Dict[str, Any]:
@@ -1085,6 +1347,13 @@ class LackEpisodeAutoSub(_PluginBase):
                     "total_timeout": stats.get("total_timeout", 0),    # 超时未补齐数
                     "today_subscribed": today_count,                # 今日已订阅数
                     "daily_quota": self._daily_quota,               # 今日配额
+                    # 爱影 API 本月剩余次数（最近一次响应的 times，v1.7.0）
+                    "aiying_api_quota": (self.get_data(self._DATA_AIYING) or {})
+                    .get("api_quota_left"),
+                    # 当前生效的 SA 提交通道（v1.8.0）：http/tg/none
+                    "sa_channel": ("http" if self.__sa_http_ready()
+                                   else "tg" if (_TG_LIB_OK and self._sa_bot)
+                                   else "none"),
                     "progress": self.get_data(self._DATA_PROGRESS) or {},  # 实时进度快照
                 },
             }
@@ -1182,6 +1451,141 @@ class LackEpisodeAutoSub(_PluginBase):
             logger.error(f"【{self.plugin_name}】API 查询 TG 状态失败: {e}")
             return {"success": False, "message": str(e), "data": None}
 
+    @staticmethod
+    def __parse_eps_param(eps: str) -> Tuple[Set[Tuple[int, int]], Dict[int, List[int]]]:
+        """
+        解析 /ay_api_test 的 eps 参数（v1.9.0，纯函数可独立测试）。
+        格式：`1:6-10;2:1-3` 表示 S01E06-10 和 S02E01-03。
+        返回 (缺集集合, {季: [集号,...]})；空/非法片段跳过。
+        """
+        lack: Set[Tuple[int, int]] = set()
+        season_eps: Dict[int, List[int]] = {}
+        for seg in (eps or "").split(";"):
+            m = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*(?:-\s*(\d+)\s*)?", seg or "")
+            if not m:
+                continue
+            s, e1 = int(m.group(1)), int(m.group(2))
+            e2 = int(m.group(3)) if m.group(3) else e1
+            eps_set = set(range(min(e1, e2), max(e1, e2) + 1))
+            lack |= {(s, e) for e in eps_set}
+            season_eps[s] = sorted(set(season_eps.get(s) or []) | eps_set)
+        return lack, season_eps
+
+    def api_ay_api_test(self, tmdb_id: int = 0, save: int = 0,
+                        eps: str = "") -> Dict[str, Any]:
+        """
+        API 端点：爱影 HTTP API 联调测试（v1.7.0）。
+          save=0（默认）：只查 API，返回解析后的资源列表与额度，不提交 SA；
+          save=1：查 API + 经 SA 通道提交第一条链接并返回 SA 回执（端到端联调）；
+          eps（可选，v1.9.0）：模拟缺集，格式 `1:6-10;2:1-3`（S01E06-10 与
+            S02E01-03），传入时选包逻辑用该缺集跑，返回 covered/uncovered
+            明细与选包理由；不传时按 v1.7.0 策略选包，行为不变。
+        返回 JSON 含 http 状态/资源数/选中链接/SA 回执/当前额度/tg_id 来源。
+        """
+        logger.info(f"【{self.plugin_name}】收到爱影 API 联调测试请求 "
+                    f"tmdb_id={tmdb_id} save={save} eps={eps or '-'}")
+        try:
+            tmdbid = int(tmdb_id)
+        except (TypeError, ValueError):
+            tmdbid = 0
+        if not tmdbid:
+            return {"success": False, "message": "参数 tmdb_id 必填（数字）", "data": None}
+        # tg_id 来源：配置 / TG 会话（拿不到直接返回，不建额外连接）
+        tg_id, tg_src = self.__resolve_tg_id()
+        if not tg_id:
+            return {"success": False,
+                    "message": "无法获取 tg_id：配置未填且 TG 会话不可用",
+                    "data": {"tg_id_source": "无"}}
+        try:
+            res = self.__ay_api_query(tmdbid, tg_id)
+        except Exception as e:
+            return {"success": False,
+                    "message": f"爱影 API 请求异常: {e}",
+                    "data": {"tg_id": tg_id, "tg_id_source": tg_src}}
+        resources = res.get("resources") or []
+        # v1.9.0：传入 eps 时按模拟缺集跑精确选包，否则退化为 v1.7.0 策略
+        mock_lack, mock_season_eps = self.__parse_eps_param(eps)
+        if mock_lack:
+            picks, pick_reason = self.__ay_pick_links(
+                resources, self._aiying_api_max_links, mock_lack, mock_season_eps)
+        else:
+            picks, pick_reason = self.__ay_pick_links(
+                resources, self._aiying_api_max_links)
+        data: Dict[str, Any] = {
+            "http_status": res.get("http_status"),
+            "api_message": res.get("message", ""),
+            "resource_count": len(resources),
+            "resources": [{
+                "name": r.get("name", ""),
+                "notes": r.get("notes", ""),
+                "size": r.get("size", ""),
+                "category": r.get("category", ""),
+                "link": r.get("link", ""),
+            } for r in resources],
+            "selected_links": [p.get("link", "") for p in picks],
+            "quota_left": res.get("quota_left"),
+            "tg_id": tg_id,
+            "tg_id_source": tg_src,
+            "sa_result": None,
+        }
+        # eps 模拟选包明细：逐包覆盖、已覆盖/未覆盖集、选包理由
+        if mock_lack:
+            covered: Set[Tuple[int, int]] = set()
+            for p in picks:
+                p_text = f"{p.get('name') or ''} {p.get('notes') or ''}"
+                covered |= self.__ay_resource_cover(p_text, mock_season_eps)
+            covered &= mock_lack
+            data["eps_test"] = {
+                "lack": sorted(f"S{s:02d}E{e:02d}" for s, e in mock_lack),
+                "pick_reason": pick_reason,
+                "covered": sorted(f"S{s:02d}E{e:02d}" for s, e in covered),
+                "uncovered": sorted(f"S{s:02d}E{e:02d}"
+                                    for s, e in (mock_lack - covered)),
+                "picks": [{"name": p.get("name", ""), "notes": p.get("notes", ""),
+                           "size": p.get("size", ""), "link": p.get("link", "")}
+                          for p in picks],
+            }
+        if res.get("quota_left") is not None:
+            self.__save_api_quota(res["quota_left"])
+        # save=1：端到端联调，提交第一条链接到 SA 并返回回执
+        if int(save or 0) == 1:
+            if not picks:
+                data["sa_result"] = {"ok": False, "error": "无可提交的资源链接"}
+            else:
+                mgr = self.__get_tg()
+                if not mgr:
+                    data["sa_result"] = {"ok": False, "error": "TG 管理器不可用"}
+                else:
+                    sub = mgr.submit(self._sa_bot,
+                                     [("API测试", str(picks[0].get("link") or ""))],
+                                     interval=self._aiying_interval)
+                    data["sa_result"] = sub
+                    logger.info(f"【{self.plugin_name}】联调测试 SA 提交结果: {sub}")
+        return {"success": True, "message": "OK", "data": data}
+
+    def api_sa_http_test(self, content: str = "") -> Dict[str, Any]:
+        """
+        API 端点：SA HTTP 直连联调测试（v1.8.0）。
+        用 __sa_http_send 按企业微信回调协议向 SA 发送 content
+        （默认「获取当前用户 ID」），返回 {http_status, sa_message, ok}。
+        注意：返回「消息处理成功」仅表示协议握手通过（SA 收到并开始处理），
+        命令的实际执行结果看 SA 自己的通知渠道。
+        """
+        text = (content or "").strip() or "获取当前用户 ID"
+        logger.info(f"【{self.plugin_name}】收到 SA HTTP 联调测试请求: {text[:50]}")
+        if not self.__sa_http_ready():
+            return {"success": False,
+                    "message": "SA HTTP 通道未启用或配置不齐（或 pycryptodome 未安装）",
+                    "data": {"http_status": 0, "sa_message": "", "ok": False}}
+        ok, msg = self.__sa_http_send(text)
+        return {"success": ok,
+                "message": msg if ok else f"提交失败: {msg}",
+                "data": {
+                    "http_status": getattr(self, "_last_sa_http_status", 0),
+                    "sa_message": msg,
+                    "ok": ok,
+                }}
+
     # ==================================================================
     # 核心主流程
     # ==================================================================
@@ -1234,7 +1638,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # ---------- 0. 下载验证回环：复查已订阅未核销的剧 ----------
         try:
-            self.__verify_pending(history, stats, start_time)
+            self.__verify_pending(history, stats)
         except Exception as e:
             logger.error(f"【{self.plugin_name}】入库验证环节出错（不影响后续流程）: {e}")
 
@@ -1253,12 +1657,14 @@ class LackEpisodeAutoSub(_PluginBase):
         # 本轮计数器
         scanned = 0        # 扫描到的剧集总数
         missing_shows = 0  # 发现缺集的剧数
+        ledger_skipped = 0  # 完结账本跳过部数（v1.6.0）
         subscribed = 0     # 本轮新增订阅数
         skipped = 0        # 跳过数（关键词/超限/已订阅/已处理）
         failed = 0         # 识别/请求/订阅失败数
         subscribed_titles: List[str] = []   # 本轮订阅成功的剧名（通知用）
         timeout_hit = False      # 是否触发扫描超时收尾
         circuit_broken = False   # 是否触发连续失败熔断
+        manual_stop = False      # 是否收到手动停止信号（stop_service 置位 _event）
 
         # 排除关键词列表
         exclude_words = [w.strip() for w in self._exclude_keywords.split(",")
@@ -1266,6 +1672,35 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # 获取当日剩余配额
         remaining_quota = self.__get_remaining_quota()
+
+        # ---------- 扫描模式判定（v1.6.0 增量扫描）----------
+        # 「本轮强制全量」一次性开关：本轮生效后立即回写关闭，仿 _onlyonce 模式
+        force_full = self._full_scan_once
+        if force_full:
+            self._full_scan_once = False
+            self.__update_config()
+            logger.info(f"【{self.plugin_name}】本轮强制全量扫描已生效"
+                        f"（一次性开关已自动关闭）")
+        # weekday(): 0=周一 ... 6=周日；到「每周全量扫描日」当天全量兜底重查
+        weekly_full = (start_time.weekday() == self._full_scan_weekday)
+        incremental = self._incremental_scan and not weekly_full and not force_full
+        scan_mode = "incremental" if incremental else "full"
+        # 完结账本：{tmdbid(str): {"title": 剧名, "archived_at": 时间字符串}}。
+        # 在验证回环之后读取，本轮核销写入的账本立即可用；
+        # 账本为空时第一轮自然等于全量，无需特判
+        ledger: Dict[str, Any] = self.get_data(self._DATA_DONELEDGER) or {}
+        # 待验证清单 key（str(tmdbid)，与 __register_pending 的写入格式一致）：
+        # 还在盯入库的剧即使进了账本也不跳过
+        pending_keys = set((self.get_data(self._DATA_PENDING) or {}).keys())
+        if incremental:
+            logger.info(f"【{self.plugin_name}】扫描模式：增量（完结账本 {len(ledger)} 部，"
+                        f"账本内已完结且无缺集的剧本轮跳过；每周"
+                        f"周{'一二三四五六日'[self._full_scan_weekday]}为全量日）")
+        else:
+            _full_reason = ("增量扫描未开启" if not self._incremental_scan
+                            else "今天为每周全量扫描日" if weekly_full
+                            else "本轮强制全量")
+            logger.info(f"【{self.plugin_name}】扫描模式：全量（{_full_reason}）")
 
         # ---------- 实时进度快照初始化（v1.3.0）----------
         progress: Dict[str, Any] = {
@@ -1281,6 +1716,8 @@ class LackEpisodeAutoSub(_PluginBase):
             "failed": 0,                     # 本轮失败部数
             "sub_done": 0,                   # 订阅阶段已处理候选数
             "aiying": 0,                     # 本轮爱影115通道补齐部数（v1.4.0）
+            "ledger_skipped": 0,             # 本轮完结账本跳过部数（v1.6.0）
+            "scan_mode": scan_mode,          # 本轮扫描模式 incremental/full（v1.6.0）
             "current": "",                   # 当前正在处理的剧名
             "quota_left": remaining_quota,   # 当日剩余配额
             "percent": 0,
@@ -1314,7 +1751,7 @@ class LackEpisodeAutoSub(_PluginBase):
         candidates: List[Dict[str, Any]] = []
 
         for server_name in mediaservers:
-            if timeout_hit:
+            if timeout_hit or manual_stop:
                 break
             if not server_name:
                 continue
@@ -1329,7 +1766,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 continue
 
             for library in librarys:
-                if timeout_hit:
+                if timeout_hit or manual_stop:
                     break
                 if not library or not library.id:
                     continue
@@ -1356,6 +1793,19 @@ class LackEpisodeAutoSub(_PluginBase):
                     pass
 
                 for item in items:
+                    # 【手动停止】v1.5.0 修复死代码：stop_service 置位 _event 后
+                    # 此处能感知到，写一条「手动停止」历史记录并优雅收尾
+                    if self._event.is_set():
+                        if not manual_stop:
+                            manual_stop = True
+                            logger.warning(f"【{self.plugin_name}】收到手动停止信号，"
+                                           f"扫描阶段优雅收尾（已扫 {scanned} 部）")
+                            self.__append_history(
+                                history, title="（系统）", year="", tmdbid=0,
+                                lack_info={}, missing_count=0, result="手动停止",
+                                message="收到停止信号，本轮扫描提前结束，已完成部分照常保存")
+                        break
+
                     # 【风控】单轮超时保护：超时就收尾，已扫描结果保留
                     if self.__is_timeout(start_time):
                         timeout_hit = True
@@ -1377,6 +1827,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     progress["candidates"] = len(candidates)
                     progress["skipped"] = skipped
                     progress["failed"] = failed
+                    progress["ledger_skipped"] = ledger_skipped
                     progress["percent"] = self.__calc_percent(progress)
                     if scanned % 10 == 0:
                         self.__save_progress(progress)
@@ -1397,6 +1848,18 @@ class LackEpisodeAutoSub(_PluginBase):
                         # ---- 过滤 3：本插件已处理过 ----
                         if str(tmdbid) in processed:
                             logger.debug(f"【{title}】已在已处理清单中，跳过")
+                            continue
+
+                        # ---- 过滤 3.5：增量扫描·完结账本跳过（v1.6.0）----
+                        # 账本内 = TMDB 已完结且当时无缺集的剧，集数不会再变，
+                        # 本轮直接跳过（不调 Emby episodes / TMDB）；
+                        # 但在待验证清单里的剧不跳过（还在盯入库）。
+                        # tmdbid 用 Emby 条目自带的 provider ids，不为账本多调接口。
+                        # 跳过量逐条只记 DEBUG，避免大库刷屏
+                        if (incremental and str(tmdbid) in ledger
+                                and str(tmdbid) not in pending_keys):
+                            ledger_skipped += 1
+                            logger.debug(f"【{title}】已在完结账本中，增量模式跳过")
                             continue
 
                         # ---- 3.1 取 Emby 已有季集 ----
@@ -1420,7 +1883,25 @@ class LackEpisodeAutoSub(_PluginBase):
                             continue
                         if not lack_info:
                             # 不缺集
+                            # v1.6.0：TMDB 已完结（Ended/Canceled）且无缺集 -> 写入完结账本，
+                            # 之后增量扫描直接跳过。status 取自 __find_lack_episodes 同一次
+                            # 识别返回的 tmdbinfo，不额外请求；调试模式不写账本
+                            if (not self._dry_run and str(tmdbid) not in ledger
+                                    and (getattr(tmdbinfo, "status", "") or "")
+                                    in ("Ended", "Canceled")):
+                                ledger[str(tmdbid)] = {
+                                    "title": title,
+                                    "archived_at": datetime.datetime.now(
+                                        tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+                                }
+                                logger.info(f"【{title}】已完结且无缺集，写入完结账本")
                             continue
+
+                        # v1.6.0：发现有缺集 -> 若在账本中则移除（任何模式都执行；
+                        # 完结剧出新季/用户删集都能自愈，下轮起重新参与扫描）
+                        if str(tmdbid) in ledger:
+                            del ledger[str(tmdbid)]
+                            logger.info(f"【{title}】发现缺集，已从完结账本移除")
 
                         total_missing = sum(len(eps) for eps in lack_info.values())
                         missing_shows += 1
@@ -1511,6 +1992,19 @@ class LackEpisodeAutoSub(_PluginBase):
         # 旧逻辑会让订阅阶段 2 秒内就被判超时，334 部候选一部都订不出去
         subscribe_start = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
         for index, cand in enumerate(candidates):
+            # 【手动停止】v1.5.0：订阅循环每轮开头也检查停止标志
+            if self._event.is_set():
+                if not manual_stop:
+                    manual_stop = True
+                    logger.warning(f"【{self.plugin_name}】收到手动停止信号，"
+                                   f"订阅阶段优雅收尾（剩余 {len(candidates) - index} 部留待下轮）")
+                    self.__append_history(
+                        history, title="（系统）", year="", tmdbid=0, lack_info={},
+                        missing_count=0, result="手动停止",
+                        message=f"收到停止信号，订阅阶段提前结束，"
+                                f"剩余 {len(candidates) - index} 部留待下轮")
+                break
+
             # 【风控】订阅阶段超时保护：从订阅阶段开始独立计时
             if self.__is_timeout(subscribe_start):
                 timeout_hit = True
@@ -1549,12 +2043,17 @@ class LackEpisodeAutoSub(_PluginBase):
                             f"【{title}】及之后候选留待下一轮")
                 break
 
-            # ---------- 爱影115通道（v1.4.0）：MP 订阅之前优先尝试 ----------
-            channel = "pt"   # pt / aiying / mixed
+            # ---------- 爱影115通道：MP 订阅之前优先尝试 ----------
+            # v1.7.0：查询主通道改为 HTTP API，TG 点按钮流程保留为兜底
+            channel = "pt"   # pt / aiying_api / aiying_tg / mixed
             ok, msg = False, ""
+            succ_seasons: List[int] = []   # 本轮 PT 订阅成功的季（v1.5.0）
+            fail_seasons: List[int] = []   # 本轮 PT 订阅失败的季（v1.5.0）
+            sid_map: Dict[int, int] = {}   # 成功季 -> sid（渠道明细用，v1.7.0）
             ay = None
             if aiying_usable:
                 # 【风控】单轮爱影总点击数熔断：超过 100 次本轮停止使用爱影，剩余走 PT
+                # （v1.7.0：API 查询与 SA 提交也计入该计数）
                 if aiying_clicks >= 100:
                     if not aiying_fuse_logged:
                         aiying_fuse_logged = True
@@ -1565,32 +2064,50 @@ class LackEpisodeAutoSub(_PluginBase):
                             missing_count=0, result="爱影熔断",
                             message="本轮爱影点击超过 100 次，剩余候选转 PT")
                 else:
-                    try:
-                        ay = self.__aiying_fill(cand, 100 - aiying_clicks)
-                        if ay:
-                            aiying_clicks += ay.get("clicks", 0)
-                    except Exception as e:
-                        logger.error(f"【{title}】爱影通道异常（静默转 PT 兜底）: {e}")
-                        ay = None
+                    # v1.7.0：先 HTTP API 后 TG——
+                    # API 返回 None（请求异常/tg_id 不可得）才回退 TG 点按钮流程；
+                    # API 明确「无资源」（status=none）时不再走 TG，直接转 PT
+                    if self._aiying_api_enabled:
+                        try:
+                            ay = self.__aiying_api_fill(cand, 100 - aiying_clicks)
+                            if ay:
+                                aiying_clicks += ay.get("clicks", 0)
+                        except Exception as e:
+                            logger.error(f"【{title}】爱影 API 通道异常（回退 TG 流程）: {e}")
+                            ay = None
+                    if ay is None:
+                        try:
+                            ay = self.__aiying_fill(cand, 100 - aiying_clicks)
+                            if ay:
+                                aiying_clicks += ay.get("clicks", 0)
+                        except Exception as e:
+                            logger.error(f"【{title}】爱影通道异常（静默转 PT 兜底）: {e}")
+                            ay = None
 
             if ay and ay.get("status") == "all":
                 # 全部缺集都经 115 拿到：不再调 __subscribe_show
-                ok, channel = True, "aiying"
+                ok, channel = True, ay.get("channel", "aiying_tg")
                 aiying_round += 1
-                msg = f"[爱影115] 已提交 {ay['got']} 集到 115 离线"
+                ay_detail = ay.get("detail") or f"已提交 {ay['got']} 集到 115 离线"
+                msg = f"[爱影115] {ay_detail}"
                 if ay.get("quota_left") is not None:
                     msg += f"（本月剩余次数 {ay['quota_left']}）"
             elif ay and ay.get("status") == "partial":
                 # 部分集拿到：拿不到的集仍走 MP 订阅（MP 会自己比对只补缺集）
-                ok_pt, msg_pt = self.__subscribe_show(
-                    title, cand["year"], cand["tmdbid"], cand["lack_info"])
-                ok, channel = True, "mixed"
+                ok_pt, succ_seasons, fail_seasons, msg_pt, sid_map = \
+                    self.__subscribe_show(
+                        title, cand["year"], cand["tmdbid"], cand["lack_info"])
+                # v1.5.0 修复：mixed 分支的成败以 PT 订阅的实际结果为准，
+                # 爱影部分成功不再抵消 PT 失败（此前无条件 ok=True，PT 失败也销账，
+                # 失败的季永不再补）
+                ok, channel = ok_pt, "mixed"
                 aiying_round += 1
-                msg = (f"[爱影115] {ay['got']} 集已提交 115；"
+                ay_detail = ay.get("detail") or f"{ay['got']} 集已提交 115"
+                msg = (f"[爱影115] {ay_detail}；"
                        f"剩余 {cand['missing'] - ay['got']} 集转 PT：{msg_pt}")
                 if not ok_pt:
                     logger.warning(f"【{title}】爱影已补 {ay['got']} 集，"
-                                   f"剩余集 PT 订阅未成功: {msg_pt}")
+                                   f"剩余集 PT 订阅未全部成功: {msg_pt}")
             else:
                 # 爱影完全没资源/超时/异常：静默落到 MP 订阅（PT 兜底）
                 prefix = ""
@@ -1598,8 +2115,9 @@ class LackEpisodeAutoSub(_PluginBase):
                     prefix = ("爱影无资源，转 PT：" if ay is not None
                               else "爱影通道异常，转 PT：")
                 # 逐季添加订阅（MP 订阅后自己会比对媒体库只补缺集）
-                ok, msg_pt = self.__subscribe_show(
-                    title, cand["year"], cand["tmdbid"], cand["lack_info"])
+                ok, succ_seasons, fail_seasons, msg_pt, sid_map = \
+                    self.__subscribe_show(
+                        title, cand["year"], cand["tmdbid"], cand["lack_info"])
                 msg = prefix + (msg_pt or "")
 
             # 【风控】订阅间隔：无论成败都 sleep，避免瞬间打爆 MP/TMDB/PT 站
@@ -1617,11 +2135,30 @@ class LackEpisodeAutoSub(_PluginBase):
                 progress["percent"] = self.__calc_percent(progress)
                 self.__save_progress(progress)
                 self.__incr_daily_quota()
-                # 通知里区分来源渠道
-                channel_tag = {"aiying": "[爱影115]", "mixed": "[爱影+PT]"}.get(
-                    channel, "[PT下载]")
-                subscribed_titles.append(f"{channel_tag} {title}（缺 {cand['missing']} 集）")
+                # 通知里区分来源渠道（v1.7.0：前缀扩为 [PT]/[115·API]/[115·TG]/[混合]，115 附资源摘要）
+                channel_tag = {"aiying_api": "[115·API]", "aiying_tg": "[115·TG]",
+                               "aiying": "[115·TG]", "mixed": "[混合]"}.get(
+                    channel, "[PT]")
+                brief = ""
+                if ay and channel in ("aiying_api", "aiying_tg", "aiying", "mixed"):
+                    brief = (ay.get("notes_brief") or "")[:40]
+                subscribed_titles.append(
+                    f"{channel_tag} {title}（缺 {cand['missing']} 集）"
+                    + (f"｜{brief}" if brief else ""))
+                # v1.7.0：组织渠道人话明细，写进历史记录
+                if channel == "pt":
+                    channel_detail = self.__pt_detail(sid_map)
+                else:
+                    channel_detail = (ay or {}).get("detail") or ""
+                    if channel == "mixed":
+                        _pt_part = self.__pt_detail(sid_map)
+                        if _pt_part:
+                            channel_detail = (
+                                (channel_detail + "；") if channel_detail else ""
+                            ) + f"PT {_pt_part}"
                 # 标记已处理，下一轮不再重复
+                # v1.5.0：能走到这里说明该剧所有缺集季都订阅成功（或纯爱影补齐），
+                # 部分季失败的剧走 else 分支，不会写 processed，下轮重新评估
                 processed[str(cand["tmdbid"])] = {
                     "title": title,
                     "time": datetime.datetime.now(
@@ -1629,11 +2166,16 @@ class LackEpisodeAutoSub(_PluginBase):
                     "seasons": sorted(cand["lack_info"].keys()),
                 }
                 # 【验证回环】登记"已订阅未核销"快照，之后每轮复查入库情况
-                self.__register_pending(cand, channel=channel)
+                # v1.9.0：传入本轮订阅成功的季（纯 115 补齐时 sid_map 为空，
+                # None 表示全部缺集季）
+                self.__register_pending(
+                    cand, channel=channel,
+                    seasons_done=sorted(sid_map.keys()) if sid_map else None)
                 self.__append_history(
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
-                    result="已订阅", message=msg)
+                    result="已订阅", message=msg,
+                    channel=channel, channel_detail=channel_detail)
             else:
                 failed += 1
                 consecutive_failures += 1
@@ -1641,10 +2183,43 @@ class LackEpisodeAutoSub(_PluginBase):
                 progress["sub_done"] = index + 1
                 progress["percent"] = self.__calc_percent(progress)
                 self.__save_progress(progress)
-                self.__append_history(
-                    history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
-                    lack_info=cand["lack_info"], missing_count=cand["missing"],
-                    result="订阅失败", message=msg)
+                # v1.5.0：区分「全部订阅失败」与「部分季失败」——部分失败的剧
+                # 不写 processed，下轮重新评估；已成功的季下轮会被
+                # 「该季已有订阅则跳过」逻辑挡住，不会重复订（见 __subscribe_show 注释）
+                if succ_seasons:
+                    # v1.9.0：部分季失败时，成功季也纳入验证回环（此前这些季的
+                    # 订阅永远不被复查）；下轮剩余季成功后会合并进同一快照
+                    cand_partial = dict(cand)
+                    cand_partial["lack_info"] = {
+                        s: cand["lack_info"][s] for s in succ_seasons
+                        if s in cand["lack_info"]}
+                    cand_partial["missing"] = sum(
+                        len(v) for v in cand_partial["lack_info"].values())
+                    if cand_partial["lack_info"]:
+                        self.__register_pending(
+                            cand_partial, channel=channel,
+                            seasons_done=sorted(succ_seasons))
+                    self.__append_history(
+                        history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
+                        lack_info=cand["lack_info"], missing_count=cand["missing"],
+                        result="部分季订阅失败",
+                        message=f"{msg}；该剧未销账，失败季 {fail_seasons} 下轮重试",
+                        channel=channel,
+                        channel_detail=(ay or {}).get("detail", ""))
+                else:
+                    self.__append_history(
+                        history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
+                        lack_info=cand["lack_info"], missing_count=cand["missing"],
+                        result="订阅失败", message=msg,
+                        channel=channel,
+                        channel_detail=(ay or {}).get("detail", ""))
+
+                # v1.6.0：订阅未全部成功（含部分季失败）需要下轮重试的剧，
+                # 若在完结账本中则移除，保证下轮重新评估
+                if str(cand["tmdbid"]) in ledger:
+                    del ledger[str(cand["tmdbid"])]
+                    logger.info(f"【{title}】订阅未全部成功，已从完结账本移除，"
+                                f"下轮重新评估")
 
                 # 【风控】连续失败熔断：MP/TMDB/网络很可能已出问题，及时止损
                 if consecutive_failures >= self._max_consecutive_failures:
@@ -1671,6 +2246,8 @@ class LackEpisodeAutoSub(_PluginBase):
         self.save_data(self._DATA_PROCESSED, processed)
         self.save_data(self._DATA_HISTORY, history[-200:])  # 最多保留 200 条
         self.save_data(self._DATA_STATS, stats)
+        # v1.6.0：完结账本随轮次落盘（写入/移除都在本轮内存副本上操作）
+        self.save_data(self._DATA_DONELEDGER, ledger)
 
         elapsed = (datetime.datetime.now(tz=pytz.timezone(settings.TZ))
                    - start_time).total_seconds()
@@ -1682,6 +2259,8 @@ class LackEpisodeAutoSub(_PluginBase):
             "candidates": len(candidates), "subscribed": subscribed,
             "skipped": skipped, "failed": failed,
             "aiying": aiying_round,
+            "ledger_skipped": ledger_skipped,
+            "scan_mode": scan_mode,
             "current": "", "quota_left": remaining_quota,
             "percent": 100,
             "finished_at": datetime.datetime.now(
@@ -1691,9 +2270,12 @@ class LackEpisodeAutoSub(_PluginBase):
         self.__save_progress(progress)
 
         logger.info(f"【{self.plugin_name}】===== 本轮结束，耗时 {elapsed:.0f} 秒："
-                    f"新增订阅 {subscribed} 部，跳过 {skipped} 部，失败 {failed} 部"
+                    f"新增订阅 {subscribed} 部，跳过 {skipped} 部，失败 {failed} 部，"
+                    f"账本跳过 {ledger_skipped} 部"
+                    f"（{'增量' if scan_mode == 'incremental' else '全量'}模式）"
                     f"{'，已熔断' if circuit_broken else ''}"
-                    f"{'，超时收尾' if timeout_hit else ''} =====")
+                    f"{'，超时收尾' if timeout_hit else ''}"
+                    f"{'，手动停止' if manual_stop else ''} =====")
 
         # ---------- 5. 汇总通知 ----------
         if self._notify:
@@ -1702,7 +2284,9 @@ class LackEpisodeAutoSub(_PluginBase):
                                 subscribed_titles=subscribed_titles,
                                 elapsed=elapsed,
                                 circuit_broken=circuit_broken,
-                                timeout_hit=timeout_hit)
+                                timeout_hit=timeout_hit,
+                                scan_mode=scan_mode,
+                                ledger_skipped=ledger_skipped)
 
     def __is_timeout(self, start_time: datetime.datetime) -> bool:
         """单轮任务是否已超过配置的超时分钟数"""
@@ -1713,20 +2297,58 @@ class LackEpisodeAutoSub(_PluginBase):
     # ==================================================================
     # 下载验证回环 0：订阅后入库验证
     # ==================================================================
-    def __register_pending(self, cand: Dict[str, Any], channel: str = "pt"):
-        """订阅成功后登记快照：之后每轮复查 Emby 是否真入库。
-        channel：补齐渠道（pt=纯 PT 订阅 / aiying=纯爱影115 / mixed=爱影+PT 混合），
-        v1.4.0 新增，核销时 115 渠道会退订本插件此前添加的 PT 订阅"""
+    def __register_pending(self, cand: Dict[str, Any], channel: str = "pt",
+                           seasons_done: Optional[List[int]] = None):
+        """
+        订阅成功后登记快照：之后每轮复查 Emby 是否真入库。
+        channel：补齐渠道（pt=纯 PT 订阅 / aiying_api/aiying_tg=纯115 / mixed=混合）。
+        v1.9.0：支持按成功季登记与合并——
+          ①部分季订阅成功时也把成功季纳入快照（此前只有整部全部成功才登记，
+            部分成功季的订阅永远不被复查）；
+          ②下轮重评该剧剩余季成功后，合并进既有快照（seasons/remaining 取并集
+            更新，同一部剧在待验证列表里只占一条，不新建不覆盖）；
+          ③新增 done_seasons 字段记录已订阅成功的季；旧快照缺该字段时
+            按全集缺集处理（核销逻辑不变：remaining 清零才核销）。
+        seasons_done：本次订阅成功的季号列表；None 表示 cand 里全部缺集季。
+        """
         pending: Dict[str, Any] = self.get_data(self._DATA_PENDING) or {}
-        # 快照内容：tmdbid、剧名、年份、缺集列表、订阅时间、Emby 定位信息、渠道
-        pending[str(cand["tmdbid"])] = {
+        key = str(cand["tmdbid"])
+        new_seasons = {str(s): list(eps) for s, eps in cand["lack_info"].items()}
+        new_done = sorted(seasons_done if seasons_done is not None
+                          else cand["lack_info"].keys())
+
+        existing = pending.get(key)
+        if existing:
+            # ---- 合并进既有快照：缺集/剩余缺集取并集，保留最早订阅时间 ----
+            merged_seasons = dict(existing.get("seasons") or {})
+            merged_remaining = dict(existing.get("remaining") or {})
+            for s, eps in new_seasons.items():
+                merged_seasons[s] = sorted(set(merged_seasons.get(s, [])) | set(eps))
+                merged_remaining[s] = sorted(
+                    set(merged_remaining.get(s, [])) | set(eps))
+            existing["seasons"] = merged_seasons
+            existing["remaining"] = merged_remaining
+            existing["done_seasons"] = sorted(
+                set(existing.get("done_seasons") or []) | set(new_done))
+            if channel:
+                existing["channel"] = channel
+            pending[key] = existing
+            self.save_data(self._DATA_PENDING, pending)
+            logger.info(f"【{cand['title']}】验证快照已合并：累计纳入 "
+                        f"{len(merged_seasons)} 季，剩余缺集 "
+                        f"{sum(len(v) for v in merged_remaining.values())} 集")
+            return
+
+        # ---- 新登记快照：tmdbid、剧名、年份、缺集列表、订阅时间、Emby 定位、渠道 ----
+        pending[key] = {
             "title": cand["title"],
             "year": cand["year"],
             "tmdbid": cand["tmdbid"],
             "server": cand["server"],        # Emby 服务器名（复查时直接定位）
             "item_id": cand["item_id"],      # Emby 剧集 ID（复查时直接定位）
-            "seasons": {str(s): list(eps) for s, eps in cand["lack_info"].items()},
-            "remaining": {str(s): list(eps) for s, eps in cand["lack_info"].items()},
+            "seasons": new_seasons,
+            "remaining": {str(s): list(eps) for s, eps in new_seasons.items()},
+            "done_seasons": new_done,        # 已订阅成功的季（v1.9.0）
             "channel": channel,              # 补齐渠道（v1.4.0）
             "subscribe_time": datetime.datetime.now(
                 tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
@@ -1737,18 +2359,24 @@ class LackEpisodeAutoSub(_PluginBase):
                     f"缺集 {cand['missing']} 集，之后每轮复查")
 
     def __verify_pending(self, history: List[Dict[str, Any]],
-                         stats: Dict[str, Any], start_time: datetime.datetime):
+                         stats: Dict[str, Any]):
         """
         复查所有「已订阅未核销」的剧：
           全部补齐 -> 核销 + 统计 +（可选）✅ 通知
           部分补齐 -> 更新剩余缺集，继续等
-          超过 verify_alert_days 未补齐 -> 告警通知（只一次），历史标记「超时未补齐」
+          超过 verify_alert_days 未补齐 -> 告警通知（只一次），历史标记「超时未补齐」，
+            并按配置执行超时闭环动作（自动重置订阅 / 订阅丢失补订，v1.5.0）
         单部复查失败跳过该部，不中断整轮复查。
         """
         pending: Dict[str, Any] = self.get_data(self._DATA_PENDING) or {}
         if not pending:
             logger.debug(f"【{self.plugin_name}】无待验证的订阅，跳过入库复查")
             return
+
+        # v1.5.0 修复：验证回环使用独立的计时起点与超时预算（复用「单轮超时保护」
+        # 配置值，即验证最多再花同样时长），不再与扫描阶段共用同一个 start_time——
+        # 此前 pending 积压时复查会吃光扫描阶段的 60 分钟预算，扫描开头即被判超时
+        start_time = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
 
         logger.info(f"【{self.plugin_name}】开始入库验证：共 {len(pending)} 部待复查")
         now = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
@@ -1804,12 +2432,33 @@ class LackEpisodeAutoSub(_PluginBase):
                     history, title=title, year=str(entry.get("year", "")),
                     tmdbid=int(entry.get("tmdbid") or 0), lack_info={},
                     missing_count=0, result="已补齐核销",
-                    message=f"订阅后第 {wait_days} 天确认全部入库")
+                    message=f"订阅后第 {wait_days} 天确认全部入库",
+                    channel=entry.get("channel", ""))
                 # v1.4.0：115 渠道补齐的剧，退订本插件此前添加的 PT 订阅，避免重复下载
                 try:
                     self.__unsub_pt_if_115(entry, title, history)
                 except Exception as e:
                     logger.error(f"【{title}】退订 PT 订阅检查失败（不影响核销）: {e}")
+                # v1.6.0：核销时若 TMDB 已完结（Ended/Canceled），写入完结账本，
+                # 之后增量扫描直接跳过。核销事件量小，这里额外一次
+                # recognize_media 换 status 可接受；调试模式不写账本
+                if not self._dry_run:
+                    try:
+                        _tid = int(entry.get("tmdbid") or 0)
+                        _mi = (self._mediaChain.recognize_media(
+                            mtype=MediaType.TV, tmdbid=_tid)) if _tid else None
+                        if _mi and (getattr(_mi, "status", "") or "") in ("Ended", "Canceled"):
+                            ledger = self.get_data(self._DATA_DONELEDGER) or {}
+                            if str(_tid) not in ledger:
+                                ledger[str(_tid)] = {
+                                    "title": title,
+                                    "archived_at": datetime.datetime.now(
+                                        tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+                                }
+                                self.save_data(self._DATA_DONELEDGER, ledger)
+                                logger.info(f"【{title}】核销且已完结，写入完结账本")
+                    except Exception as e:
+                        logger.error(f"【{title}】写入完结账本失败（不影响核销）: {e}")
             elif status == "timeout" and not entry.get("alerted"):
                 # 超时未补齐 -> 告警一次（不自动退订，只提醒）
                 entry["remaining"] = new_remaining
@@ -1824,7 +2473,14 @@ class LackEpisodeAutoSub(_PluginBase):
                     history, title=title, year=str(entry.get("year", "")),
                     tmdbid=int(entry.get("tmdbid") or 0), lack_info={},
                     missing_count=remaining_count, result="超时未补齐",
-                    message=f"订阅 {wait_days} 天未入库，请人工检查资源")
+                    message=f"订阅 {wait_days} 天未入库，请人工检查资源",
+                    channel=entry.get("channel", ""))
+                # v1.5.0：超时闭环动作——订阅还在则自动重置（默认开），
+                # 订阅丢失则按配置决定是否补订（默认关），仅在首次告警这一轮执行一次
+                try:
+                    self.__handle_timeout_subscription(entry, title, history)
+                except Exception as e:
+                    logger.error(f"【{title}】超时订阅闭环处理失败（不影响告警）: {e}")
             else:
                 # waiting 或已告警过的 timeout：更新剩余缺集，继续等
                 if new_remaining != entry.get("remaining"):
@@ -1913,6 +2569,111 @@ class LackEpisodeAutoSub(_PluginBase):
         if wait_days >= alert_days:
             return "timeout", new_remaining, wait_days
         return "waiting", new_remaining, wait_days
+
+    def __handle_timeout_subscription(self, entry: Dict[str, Any], title: str,
+                                      history: List[Dict[str, Any]]):
+        """
+        超时未入库时的闭环动作（v1.5.0 新增，仅在首次告警那一轮执行一次）：
+          1. 「超时自动重置订阅」（默认开）：MP 里该订阅仍存在时，对它做重置
+             （note 清空、lack_episode 重置为 total_episode），让 MP 下轮周期搜索
+             重新搜整季——相当于自动帮用户点了「重新搜索」；
+          2. 「订阅丢失自动补订」（默认关）：订阅已不存在时，按快照剩余缺集重新走
+             __subscribe_show 补订。订阅消失多半是用户手动退订，所以默认关，
+             尊重用户操作。
+        两个动作都只处理 username=本插件名 的订阅（list_by_username 过滤），
+        绝不动用户手动建的订阅；调试模式下都只记录日志不执行。
+        """
+        try:
+            tmdbid = int(entry.get("tmdbid") or 0)
+        except (TypeError, ValueError):
+            return
+        if not tmdbid:
+            return
+        # 快照里登记过的缺集季
+        seasons: List[int] = []
+        for s in (entry.get("seasons") or {}).keys():
+            try:
+                seasons.append(int(s))
+            except (TypeError, ValueError):
+                continue
+        if not seasons:
+            return
+
+        # 查出本插件为该剧添加的订阅（username=插件名，用户手动订阅不在其中）
+        try:
+            my_subs = [sub for sub in
+                       (self._subOper.list_by_username(self.plugin_name) or [])
+                       if getattr(sub, "tmdbid", None) == tmdbid]
+        except Exception as e:
+            logger.error(f"【{title}】查询本插件订阅失败，跳过超时闭环处理: {e}")
+            return
+        sub_by_season = {getattr(sub, "season", None): sub for sub in my_subs}
+
+        # ---- 动作 1：订阅还在 -> 重置 ----
+        reset_seasons: List[int] = []
+        missing_seasons: List[int] = []
+        for season in seasons:
+            sub = sub_by_season.get(season)
+            if sub is None:
+                missing_seasons.append(season)
+                continue
+            if not self._verify_auto_reset:
+                continue
+            total_ep = getattr(sub, "total_episode", 0) or 0
+            if self._dry_run:
+                logger.info(f"【{title}】[调试] 第 {season} 季订阅超时，将重置订阅 "
+                            f"(sid={sub.id})：note 清空、lack_episode 重置为 {total_ep}")
+                reset_seasons.append(season)
+                continue
+            try:
+                payload: Dict[str, Any] = {"note": ""}
+                if total_ep > 0:
+                    payload["lack_episode"] = total_ep
+                self._subOper.update(sub.id, payload)
+                reset_seasons.append(season)
+                logger.info(f"【{title}】第 {season} 季订阅超时未入库，已重置订阅 "
+                            f"(sid={sub.id})，MP 下轮周期搜索将重新搜索整季")
+            except Exception as e:
+                logger.error(f"【{title}】第 {season} 季重置订阅失败: {e}")
+
+        if reset_seasons:
+            self.__append_history(
+                history, title=title, year=str(entry.get("year", "")),
+                tmdbid=tmdbid, lack_info={}, missing_count=0,
+                result="超时重置订阅",
+                message=f"已重置第 {reset_seasons} 季订阅，MP 下轮将重新搜索"
+                        + ("（调试模式仅记录）" if self._dry_run else ""))
+
+        # ---- 动作 2：订阅已不存在 -> 按剩余缺集补订（默认关） ----
+        if not missing_seasons:
+            return
+        if not self._verify_auto_resubscribe:
+            logger.info(f"【{title}】第 {missing_seasons} 季订阅已不存在"
+                        f"（可能是手动退订），「订阅丢失自动补订」未开启，不补订")
+            return
+        # 只补仍有剩余缺集的季
+        remaining = entry.get("remaining") or {}
+        lack_info: Dict[int, List[int]] = {}
+        for season in missing_seasons:
+            eps = remaining.get(str(season)) or []
+            if eps:
+                lack_info[season] = list(eps)
+        if not lack_info:
+            logger.info(f"【{title}】丢失的订阅季已无剩余缺集，无需补订")
+            return
+        if self._dry_run:
+            logger.info(f"【{title}】[调试] 订阅丢失，将按剩余缺集补订季: "
+                        f"{sorted(lack_info.keys())}")
+            return
+        ok, succ, fail, msg, _sids = self.__subscribe_show(
+            title, str(entry.get("year", "")), tmdbid, lack_info)
+        logger.info(f"【{title}】订阅丢失自动补订结果: {msg}")
+        self.__append_history(
+            history, title=title, year=str(entry.get("year", "")),
+            tmdbid=tmdbid, lack_info=lack_info,
+            missing_count=sum(len(v) for v in lack_info.values()),
+            result="超时补订" if ok else "超时补订失败",
+            message=f"原订阅已丢失，按剩余缺集重新订阅：{msg}")
 
     # ==================================================================
     # 下载验证回环 1：qb 死任务检测
@@ -2258,12 +3019,21 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def __subscribe_show(
         self, title: str, year: str, tmdbid: int, lack_info: Dict[int, List[int]]
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, List[int], List[int], str, Dict[int, int]]:
         """
         对一部剧的缺集季逐季添加 MP 订阅。
-        只要有一季成功即视为成功（MP 订阅后自行比对媒体库只下载缺集）。
+        v1.5.0 起返回结构化结果；v1.7.0 追加第五个返回值 sid_map：
+        (是否全部成功, 成功季列表, 失败季列表, 汇总消息, {季号: sid})。
+        只有所有缺集季都订阅成功才算成功，调用方才把该剧写入已处理清单；
+        部分失败的剧不进已处理清单，下轮重新评估——已成功的季会被
+        __find_lack_episodes 里「该季已有订阅则跳过」（subOper.exists 判断）挡住，
+        且 SubscribeChain.add(exist_ok=True) 对已存在订阅也是复用而不报错，
+        双重保障下轮不会重复订阅同一季。
+        （MP 订阅后自行比对媒体库只下载缺集。）
         """
         success_seasons: List[int] = []
+        failed_seasons: List[int] = []
+        sid_map: Dict[int, int] = {}   # 订阅成功的季 -> sid（渠道明细记录用，v1.7.0）
         last_msg = ""
         for season in sorted(lack_info.keys()):
             try:
@@ -2281,16 +3051,110 @@ class LackEpisodeAutoSub(_PluginBase):
                 last_msg = msg or ""
                 if sid:
                     success_seasons.append(season)
+                    sid_map[season] = sid
                     logger.info(f"【{title}】第 {season} 季订阅添加成功 (sid={sid})")
+                    # v1.5.0：订阅成功后立即触发 MP 搜索该订阅（可选，默认开）
+                    self.__trigger_subscribe_search(sid, title, season)
                 else:
+                    failed_seasons.append(season)
                     logger.warning(f"【{title}】第 {season} 季订阅添加失败: {msg}")
             except Exception as e:
                 last_msg = str(e)
+                failed_seasons.append(season)
                 logger.error(f"【{title}】第 {season} 季订阅异常: {e}")
 
+        if success_seasons and not failed_seasons:
+            return (True, success_seasons, failed_seasons,
+                    f"已订阅季: {success_seasons}", sid_map)
         if success_seasons:
-            return True, f"已订阅季: {success_seasons}"
-        return False, f"所有缺集季订阅失败，最后错误: {last_msg}"
+            # 部分季成功：不算成功（调用方不销账），消息里带失败季号便于排查
+            return (False, success_seasons, failed_seasons,
+                    f"部分季订阅成功 {success_seasons}，失败季 {failed_seasons}，"
+                    f"最后错误: {last_msg}", sid_map)
+        return (False, success_seasons, failed_seasons,
+                f"所有缺集季订阅失败，最后错误: {last_msg}", sid_map)
+
+    def __trigger_subscribe_search(self, sid: int, title: str, season: int):
+        """
+        订阅添加成功后，立即触发 MP 对该订阅做一次搜索（v1.5.0 新增，
+        配置项「订阅后立即搜索」，默认开）。
+        解决「订阅了但半天没动静」：MP 周期搜索每个订阅之间随机休眠 60~300 秒，
+        订阅多时新订阅要等很久才轮到；而 Scheduler().start("subscribe_search",
+        sid=非空, state=None, manual=True) 指定单个订阅时不会随机休眠，直接搜这一部。
+        失败只记日志，不影响订阅主流程；调试模式下不触发。
+        """
+        if not self._search_after_subscribe:
+            return
+        if self._dry_run:
+            return
+        # v1.8.1：异步触发——Scheduler().start 是同步执行一整次订阅搜索
+        # （识别+站点查询+匹配，实测单部 1~13 分钟），直接在扫描循环里调用
+        # 会把主流程卡死；改为 daemon 线程后台执行，扫描继续往下走。
+        threading.Thread(target=self.__do_trigger_search,
+                         args=(sid, title, season), daemon=True).start()
+        # 同一部剧多季连续触发时每次至少间隔 1 秒，避免瞬间打爆搜索
+        time.sleep(1)
+
+    def __do_trigger_search(self, sid: int, title: str, season: int):
+        """后台线程里真正执行的即时搜索触发（v1.8.1 拆出）"""
+        # v1.9.0：触发前先探 Emby 就绪——Emby 重启/未就绪时 MP 的 media_exists
+        # 查询失败会误判「整季缺失」拖整季大包（实测大明风华 131G 事故）；
+        # 未就绪则跳过本次触发（订阅已建，MP 周期搜索会兜底），不影响主流程
+        try:
+            emby_ok = self.__emby_ready()
+        except Exception:
+            emby_ok = False   # 探测自身异常按「未就绪」处理
+        if not emby_ok:
+            logger.info(f"【{title}】Emby 未就绪，跳过第 {season} 季即时搜索触发 "
+                        f"(sid={sid})，由 MP 周期搜索兜底")
+            return
+        try:
+            # 惰性导入：与 MP 官方插件习惯一致，且极端环境下导入失败不影响插件加载
+            from app.scheduler import Scheduler
+            Scheduler().start("subscribe_search", sid=sid, state=None, manual=True)
+            logger.info(f"【{title}】第 {season} 季已触发即时搜索 (sid={sid})")
+        except Exception as e:
+            logger.error(f"【{title}】第 {season} 季触发即时搜索失败"
+                         f"（订阅本身已成功，不影响）: {e}")
+
+    def __emby_ready(self) -> bool:
+        """
+        探测 Emby 是否就绪（v1.9.0）：GET {host}emby/System/Info/Public
+        （公开接口无需鉴权），超时 5 秒；任一已配置媒体服务器就绪即算就绪。
+        结果做 5 分钟 TTL 缓存（一轮内不重复探测；探测失败不写入缓存，
+        下条触发前重探一次）。所有异常按「未就绪」处理。
+        """
+        now = time.time()
+        cache = self._emby_ready_cache or {}
+        if cache.get("ok") and now - float(cache.get("ts", 0)) < 300:
+            return True
+        try:
+            services = self._msHelper.get_services() or {}
+        except Exception as e:
+            logger.info(f"【{self.plugin_name}】Emby 就绪探测：读取媒体服务器配置失败"
+                        f"（按未就绪处理）: {e}")
+            return False
+        for name, conf in services.items():
+            try:
+                host = getattr(conf, "host", None)
+                if not host and isinstance(conf, dict):
+                    host = conf.get("host")
+                host = str(host or "").strip()
+                if not host:
+                    continue
+                resp = requests.get(host.rstrip("/") + "/emby/System/Info/Public",
+                                    timeout=5)
+                if resp.status_code == 200:
+                    self._emby_ready_cache = {"ok": True, "ts": now}
+                    logger.debug(f"【{self.plugin_name}】Emby 就绪探测通过: {name}")
+                    return True
+                logger.info(f"【{self.plugin_name}】Emby {name} 探测返回 "
+                            f"HTTP {resp.status_code}（按未就绪处理）")
+            except Exception as e:
+                logger.info(f"【{self.plugin_name}】Emby {name} 就绪探测异常"
+                            f"（按未就绪处理）: {e}")
+        # 失败不缓存：下一条触发前会重探
+        return False
 
     # ==================================================================
     # 配额 / 历史 / 通知 工具函数
@@ -2313,11 +3177,23 @@ class LackEpisodeAutoSub(_PluginBase):
         daily["count"] = int(daily.get("count", 0)) + 1
         self.save_data(self._DATA_DAILY, daily)
 
+    @staticmethod
+    def __pt_detail(sid_map: Dict[int, int]) -> str:
+        """PT 订阅的人话明细（v1.7.0）：订阅 S02/S03（sid=469,470）"""
+        if not sid_map:
+            return ""
+        seasons = "/".join(f"S{s:02d}" for s in sorted(sid_map))
+        sids = ",".join(str(sid_map[s]) for s in sorted(sid_map))
+        return f"订阅 {seasons}（sid={sids}）"
+
     def __append_history(self, history: List[Dict[str, Any]], title: str, year: str,
                          tmdbid: int, lack_info: Dict[int, List[int]],
-                         missing_count: int, result: str, message: str):
+                         missing_count: int, result: str, message: str,
+                         channel: str = "", channel_detail: str = ""):
         """追加一条历史记录并立即落盘（v1.3.0：原来整轮结束才保存，
-        扫描中途打开详情页看不到任何记录，现在每产生一条就能在页面看到）"""
+        扫描中途打开详情页看不到任何记录，现在每产生一条就能在页面看到）。
+        v1.7.0 新增 channel / channel_detail 两个可选字段（pt/aiying_api/aiying_tg/
+        mixed + 人话明细），老记录没有这两个字段，读取侧一律 .get() 兜底，向后兼容"""
         history.append({
             "time": datetime.datetime.now(
                 tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
@@ -2328,6 +3204,8 @@ class LackEpisodeAutoSub(_PluginBase):
             "missing_count": missing_count,
             "result": result,
             "message": message or "",
+            "channel": channel or "",
+            "channel_detail": channel_detail or "",
         })
         try:
             self.save_data(self._DATA_HISTORY, history[-200:])
@@ -2337,13 +3215,17 @@ class LackEpisodeAutoSub(_PluginBase):
     def __send_summary(self, scanned: int, missing_shows: int, subscribed: int,
                        skipped: int, failed: int,
                        subscribed_titles: List[str], elapsed: float,
-                       circuit_broken: bool, timeout_hit: bool):
+                       circuit_broken: bool, timeout_hit: bool,
+                       scan_mode: str = "full", ledger_skipped: int = 0):
         """每轮结束发送汇总通知"""
         try:
             mode = "调试模式（未真正订阅）" if self._dry_run else "正式订阅"
             lines = [
                 f"模式：{mode}",
-                f"扫描剧集：{scanned} 部，发现缺集：{missing_shows} 部",
+                # v1.6.0：带上扫描模式与账本跳过数，一眼看出本轮是不是增量
+                f"扫描：{'增量' if scan_mode == 'incremental' else '全量'}模式，"
+                f"扫描剧集 {scanned} 部，增量跳过 {ledger_skipped} 部，"
+                f"发现缺集 {missing_shows} 部",
                 f"新增订阅：{subscribed} 部，跳过：{skipped} 部，失败：{failed} 部",
                 f"耗时：{elapsed:.0f} 秒",
             ]
@@ -2457,29 +3339,40 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def __aiying_ready(self) -> bool:
         """
-        爱影通道是否可用：开关开 + telethon 可用 + TG 已登录 + SA 机器人已配置。
-        任何一步不满足都返回 False，调用方静默落 PT 兜底。
+        爱影通道是否可用（每轮只查一次）。
+        v1.8.0 起 TG 从必需降级为可选：TG 已登录时全功能（API/TG 查询 + TG 回执）；
+        TG 不可用但 SA HTTP 通道齐全且开了 API 通道时，
+        「API 查询 → HTTP 转存」链路仍可用（TG 点按钮查询兜底本轮不可用）。
+        两边都不满足才返回 False，调用方静默落 PT 兜底。
         """
         if not self._aiying_enabled:
             return False
+        # ---- TG 侧状态（可选，能登录则全功能）----
+        tg_logged_in = False
         if not _TG_LIB_OK:
-            logger.warning(f"【{self.plugin_name}】telethon 未安装，爱影通道不可用"
-                           f"（PT 订阅不受影响）")
-            return False
-        if not self._sa_bot:
-            logger.warning(f"【{self.plugin_name}】爱影通道已开启但未配置 SA 转存机器人，"
-                           f"本轮跳过爱影（PT 兜底）")
-            return False
-        mgr = self.__get_tg()
-        if not mgr:
-            return False
-        st = mgr.status()
-        if st.get("logged_in"):
-            self.__persist_tg_login(st)
+            logger.warning(f"【{self.plugin_name}】telethon 未安装，TG 侧功能不可用")
+        elif not self._sa_bot:
+            logger.warning(f"【{self.plugin_name}】未配置 SA 转存机器人，TG 提交不可用")
+        else:
+            mgr = self.__get_tg()
+            if mgr:
+                st = mgr.status()
+                if st.get("logged_in"):
+                    self.__persist_tg_login(st)
+                    tg_logged_in = True
+                else:
+                    logger.warning(f"【{self.plugin_name}】TG 未登录"
+                                   f"（{st.get('error') or '会话失效'}）")
+                    self.__persist_tg_login({"logged_in": False})
+        if tg_logged_in:
             return True
-        logger.warning(f"【{self.plugin_name}】TG 未登录（{st.get('error') or '会话失效'}），"
-                       f"爱影通道不可用，请到配置页完成登录")
-        self.__persist_tg_login({"logged_in": False})
+        # ---- v1.8.0：TG 不可用时，SA HTTP + 爱影 API 双齐全仍可用 ----
+        if self.__sa_http_ready() and self._aiying_api_enabled:
+            logger.info(f"【{self.plugin_name}】TG 不可用，但 SA HTTP 通道已配置："
+                        f"本轮爱影走「API 查询 → HTTP 转存」（TG 兜底查询不可用）")
+            return True
+        logger.warning(f"【{self.plugin_name}】爱影通道不可用：TG 未登录且 "
+                       f"SA HTTP 通道未配置齐全（PT 订阅不受影响）")
         return False
 
     def __aiying_fill(self, cand: Dict[str, Any],
@@ -2531,7 +3424,8 @@ class LackEpisodeAutoSub(_PluginBase):
         if not res.get("ok"):
             logger.info(f"【{title}】爱影查询失败：{res.get('error')}（转 PT）")
             return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
-                    "quota_left": None, "sa_failed": []}
+                    "quota_left": None, "sa_failed": [],
+                    "channel": "aiying_tg", "detail": "", "notes_brief": ""}
 
         # 持久化爱影本月剩余次数（详情页展示）
         if res.get("quota_left") is not None:
@@ -2548,17 +3442,21 @@ class LackEpisodeAutoSub(_PluginBase):
         if not links:
             logger.info(f"【{title}】爱影无本剧缺集资源（转 PT）")
             return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
-                    "quota_left": res.get("quota_left"), "sa_failed": []}
+                    "quota_left": res.get("quota_left"), "sa_failed": [],
+                    "channel": "aiying_tg", "detail": "", "notes_brief": ""}
 
         # 把拿到的 ed2k/115 链接逐条发给 SA 转存机器人
         items = [(f"S{s:02d}E{e:02d}", url) for (s, e), url in sorted(links.items())]
         logger.info(f"【{title}】爱影拿到 {len(items)} 集链接，逐条转发给 "
                     f"@{self._sa_bot} 离线到 115")
-        sub = mgr.submit(self._sa_bot, items, interval=self._aiying_interval)
+        # v1.8.0：提交走包装层（HTTP 直连优先，失败回退 TG）
+        sub = self.__sa_submit(items, title)
+        sa_via = sub.get("via", "tg")
         if not sub.get("ok"):
             logger.error(f"【{title}】SA 转存提交异常：{sub.get('error')}（已拿到的集按失败处理，转 PT）")
             return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
-                    "quota_left": res.get("quota_left"), "sa_failed": []}
+                    "quota_left": res.get("quota_left"), "sa_failed": [],
+                    "channel": "aiying_tg", "detail": "", "notes_brief": ""}
 
         results = sub.get("results") or {}
         ok_eps = {(s, e) for (s, e) in links
@@ -2577,8 +3475,556 @@ class LackEpisodeAutoSub(_PluginBase):
             status = "none"
         logger.info(f"【{title}】爱影通道结果：{status}（成功 {got} / 缺集 "
                     f"{len(lack_eps)} 集，点击 {res.get('clicks', 0)} 次）")
+        # v1.7.0：TG 流程也产出人话明细（渠道详情记录），粒度保留并补充集数
+        # v1.8.0：标明 SA 走的哪条路（HTTP 提交无回执，措辞用「已提交」）
+        sa_tag = "SA(HTTP)已提交" if sa_via == "http" else "SA(TG)转存"
+        tg_detail = f"TG 点按钮拿到 {len(items)} 集链接，{sa_tag} {got}/{len(items)} 集"
+        if sa_failed:
+            tg_detail += f"，失败 {len(sa_failed)} 集"
         return {"status": status, "got": got, "clicks": int(res.get("clicks", 0)),
-                "quota_left": res.get("quota_left"), "sa_failed": sa_failed}
+                "quota_left": res.get("quota_left"), "sa_failed": sa_failed,
+                "channel": "aiying_tg", "detail": tg_detail,
+                "notes_brief": f"TG 拿到 {len(items)} 集链接"}
+
+    # ==================================================================
+    # 爱影 HTTP API 通道（v1.7.0 新增，主通道；TG 点按钮流程保留为兜底）
+    # ==================================================================
+    def __resolve_tg_id(self) -> Tuple[Optional[str], str]:
+        """
+        解析爱影 API 需要的 tg_id：优先读配置 tg_id；没有则从 TG 会话
+        get_me 自动获取并回写配置缓存（复用 TG 管理器现有连接，不单独建连）；
+        再失败返回 (None, "")，调用方回退 TG 流程。
+        返回 (tg_id, 来源)，来源为 配置/会话（联调测试 API 展示用）。
+        """
+        if self._tg_id:
+            return self._tg_id, "配置"
+        mgr = self.__get_tg()
+        if not mgr:
+            return None, ""
+        res = mgr.my_id()
+        if res.get("ok") and res.get("tg_id"):
+            self._tg_id = str(res["tg_id"])
+            try:
+                # 缓存回写，之后直接用配置值，不再每次调 get_me
+                self.__update_config()
+            except Exception:
+                pass
+            logger.info(f"【{self.plugin_name}】已从 TG 会话获取 tg_id={self._tg_id}"
+                        f" 并缓存到配置")
+            return self._tg_id, "会话"
+        logger.warning(f"【{self.plugin_name}】获取 tg_id 失败: {res.get('error')}")
+        return None, ""
+
+    def __ay_api_query(self, tmdbid: int, tg_id: str) -> Dict[str, Any]:
+        """
+        调爱影 HTTP API 查询某部剧的资源（v1.7.0，协议已实测）。
+        POST {tg_id, type: "tv", tmdb_id, token}，超时 15 秒；
+        走 MP 全局代理（requests 默认读环境变量代理，与插件现有 HTTP 调用一致）。
+        返回 {ok, resources, quota_left, http_status, message}；
+        网络/超时/HTTP 错/JSON 解析错一律抛异常，由调用方决定回退 TG 流程。
+        """
+        resp = requests.post(
+            self._aiying_api_url,
+            json={"tg_id": str(tg_id), "type": "tv",
+                  "tmdb_id": str(tmdbid), "token": self._aiying_api_token},
+            timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get("data")
+        # 有资源时 data 是列表；无资源时是 {}（且无资源时返回字段拼写为 mesage）
+        resources = ([r for r in data if isinstance(r, dict)]
+                     if isinstance(data, list) else [])
+        return {
+            "ok": True,
+            "resources": resources,
+            "quota_left": payload.get("times"),   # 当月剩余额度，每查一次 -1
+            "http_status": resp.status_code,
+            "message": payload.get("message") or payload.get("mesage") or "",
+        }
+
+    @staticmethod
+    def __ay_resource_cover(text: str,
+                            season_eps: Dict[int, List[int]]) -> Set[Tuple[int, int]]:
+        """
+        解析单条资源的 name/notes 文本，计算它覆盖的 (季, 集) 集合（v1.9.0，
+        纯函数可独立测试）。规则：
+          S01E06-S01E10 / S1E6-E10 集范围 → 展开该范围（跨季时中间季取整季）；
+          S01E101 单集 → 单集；
+          S1-S5 / S01-S05 季范围 → 范围内各季全部集（按 season_eps 展开）；
+          S01 / 第1季 单季 → 该季全部集；
+          全集/全xx集/Complete → 全剧（season_eps 全部）；
+          无任何标识 → 视为全剧覆盖（最大溢出，选包时吃亏）。
+        season_eps 拿不到总集数的季展开为空（溢出会被低估，属可接受的近似）。
+        """
+        covered: Set[Tuple[int, int]] = set()
+
+        def _whole() -> Set[Tuple[int, int]]:
+            return {(s, e) for s, eps in season_eps.items() for e in eps}
+
+        # 整剧：全集 / 全xx集 / Complete
+        if re.search(r"全集|全\s*\d+\s*集|complete", text, re.I):
+            return _whole()
+
+        # 集范围 S01E06-S01E10 / S1E6-E10（先从文本摘出，避免被单集正则重复计）
+        def _ep_range_sub(m) -> str:
+            s1, e1 = int(m.group(1)), int(m.group(2))
+            s2 = int(m.group(3)) if m.group(3) else s1
+            e2 = int(m.group(4))
+            if (s2, e2) < (s1, e1):
+                s1, e1, s2, e2 = s2, e2, s1, e1
+            for s in range(s1, s2 + 1):
+                lo = e1 if s == s1 else 1
+                hi = e2 if s == s2 else max(season_eps.get(s) or [e2])
+                for e in range(lo, hi + 1):
+                    covered.add((s, e))
+            return " "
+
+        text = re.sub(
+            r"S(\d{1,2})E(\d{1,3})\s*[-~–]\s*(?:S(\d{1,2}))?E(\d{1,3})",
+            _ep_range_sub, text, flags=re.I)
+
+        # 单集 S01E101
+        for m in re.finditer(r"S(\d{1,2})E(\d{1,3})", text, re.I):
+            covered.add((int(m.group(1)), int(m.group(2))))
+
+        # 季范围 S1-S5 / S01-S05（后面不带 E）
+        for m in re.finditer(r"S(\d{1,2})\s*[-~–]\s*S?(\d{1,2})(?!\d*E)", text, re.I):
+            s1, s2 = sorted((int(m.group(1)), int(m.group(2))))
+            for s in range(s1, s2 + 1):
+                covered |= {(s, e) for e in season_eps.get(s) or []}
+
+        # 单季 S01 / 第1季（后面不带集号、不是范围起点）
+        for m in re.finditer(
+                r"S(\d{1,2})(?!\d*\s*[-~–E])|第\s*(\d{1,2})\s*季", text, re.I):
+            s = int(m.group(1) or m.group(2))
+            covered |= {(s, e) for e in season_eps.get(s) or []}
+
+        # 无任何标识：视为全剧覆盖（最大溢出）
+        if not covered:
+            covered = _whole()
+        return covered
+
+    @staticmethod
+    def __ay_pick_links(
+        resources: List[Dict[str, Any]], max_links: int,
+        lack_eps: Optional[Set[Tuple[int, int]]] = None,
+        season_eps: Optional[Dict[int, List[int]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        从 API 返回的资源里挑选要提交的分享链接。
+        v1.9.0 改为「按缺集精确选包」的贪心集合覆盖（缺 2 集不再拖回整季大包）：
+          1. 每条资源用 __ay_resource_cover 算出覆盖集集合；
+          2. 与缺集求交：有效覆盖 = covered ∩ lack；完全无交集的资源直接淘汰
+             （对这部剧是无关包）；
+          3. 贪心：每轮选「新增有效覆盖最大」的包；平局依次按
+             ① 115 分享链接优先（http(s):// 开头 > ed2k://，实测 ed2k 离线
+                失败率高、分享链接转存更稳，且「已转存过」兜底友好）
+             ② 溢出更小（溢出 = covered − lack；溢不出未知时 size 小者优先）
+             ③ size 小者优先；
+          4. 数量上限 max_links；选满/覆盖完即停，剩余缺集由调用方转 PT。
+        返回 (选中资源列表, 选包理由字符串)。
+        兼容 v1.7.0 调用：lack_eps/season_eps 为空时退化为
+        「整季整剧标识优先 + size 降序」，理由字符串为空。
+        注意：ed2k 打包链接一条 link 字段里可能含多行 ed2k（一行一个文件），
+        按资源条目整体算覆盖，不拆。
+        """
+        def _size_gb(r: Dict[str, Any]) -> float:
+            try:
+                return float(r.get("size") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # ---- 兼容旧调用：无缺集上下文时沿用 v1.7.0 策略 ----
+        if not lack_eps:
+            def _is_whole(r: Dict[str, Any]) -> bool:
+                text = f"{r.get('notes') or ''} {r.get('name') or ''}"
+                return bool(re.search(
+                    r"全集|全\s*\d+\s*集|complete|S\d{1,2}\s*[-~–]\s*S?\d{1,2}|S\d{2}\b",
+                    text, re.I))
+
+            whole = sorted((r for r in resources if _is_whole(r)),
+                           key=_size_gb, reverse=True)
+            rest = sorted((r for r in resources if not _is_whole(r)),
+                          key=_size_gb, reverse=True)
+            return (whole + rest)[:max(1, max_links)], ""
+
+        season_eps = season_eps or {}
+        # ---- 1/2. 逐条算覆盖、求交、淘汰无关包 ----
+        pool: List[Dict[str, Any]] = []
+        for r in resources:
+            text = f"{r.get('name') or ''} {r.get('notes') or ''}"
+            covered = LackEpisodeAutoSub.__ay_resource_cover(text, season_eps)
+            valid = covered & lack_eps
+            if not valid:
+                continue    # 完全无交集：无关包，直接淘汰
+            pool.append({
+                "res": r, "covered": covered, "valid": valid,
+                "overflow": covered - lack_eps,
+                "is_115": 0 if str(r.get("link") or "").lower().startswith("http") else 1,
+                "size": _size_gb(r),
+            })
+
+        # ---- 3/4. 贪心集合覆盖 ----
+        picks: List[Dict[str, Any]] = []
+        pick_labels: List[str] = []
+        covered_so_far: Set[Tuple[int, int]] = set()
+        remaining = list(pool)
+        while remaining and len(picks) < max(1, max_links) \
+                and covered_so_far < lack_eps:
+            # 每轮选「新增有效覆盖最大」；平局 ①115 优先 ②溢出小 ③size 小
+            best = max(
+                remaining,
+                key=lambda p: (len(p["valid"] - covered_so_far),
+                               -p["is_115"],
+                               -len(p["overflow"]),
+                               -p["size"]))
+            new_cover = best["valid"] - covered_so_far
+            if not new_cover:
+                break    # 剩下的包都不带来新增覆盖，停
+            picks.append(best["res"])
+            covered_so_far |= new_cover
+            # 选包标签：取文本里第一个集数范围/标识，取不到用 name 截断
+            r_text = f"{best['res'].get('name') or ''} {best['res'].get('notes') or ''}"
+            lm = re.search(
+                r"S\d{1,2}E\d{1,3}\s*[-~–]\s*(?:S\d{1,2})?E\d{1,3}"
+                r"|S\d{1,2}\s*[-~–]\s*S?\d{1,2}|S\d{1,2}E\d{1,3}"
+                r"|全集|全\s*\d+\s*集|S\d{2}", r_text, re.I)
+            pick_labels.append(lm.group(0) if lm else r_text.strip()[:16])
+            remaining.remove(best)
+
+        covered_n = len(covered_so_far & lack_eps)
+        reason = (f"按缺集选包：缺 {len(lack_eps)} 集，"
+                  f"选 {'+'.join(pick_labels) or '无'}，"
+                  f"预计覆盖 {covered_n}/{len(lack_eps)}")
+        return picks, reason
+
+    @staticmethod
+    def __ay_estimate_cover(resources: List[Dict[str, Any]],
+                            lack_eps: Set[Tuple[int, int]]
+                            ) -> Tuple[Optional[int], str]:
+        """
+        从资源 name/notes 尽力估算这批分享链接能覆盖多少缺集（v1.7.0，纯估算）。
+        支持模式：S01E05 单集、S1-S5/S01-S05 季范围、S01/第1季 整季、
+        全集/全xx集/Complete 整剧。
+        返回 (预计覆盖集数, 估算依据简述)；完全估不出返回 (None, "覆盖未知...")。
+        真实补齐以验证回环复查 Emby 入库为准（与现有设计一致）。
+        """
+        if not lack_eps:
+            return 0, ""
+        seasons_lack: Dict[int, Set[int]] = {}
+        for s, e in lack_eps:
+            seasons_lack.setdefault(s, set()).add(e)
+
+        covered: Set[Tuple[int, int]] = set()
+        evidence: List[str] = []
+        for r in resources:
+            text = f"{r.get('name') or ''} {r.get('notes') or ''}"
+            # 整剧：全集 / 全xx集 / Complete
+            if re.search(r"全集|全\s*\d+\s*集|complete", text, re.I):
+                covered |= set(lack_eps)
+                evidence.append("整剧")
+                continue
+            # 单集 S01E05
+            ep_hit = False
+            for m in re.finditer(r"S(\d{1,2})E(\d{1,3})", text, re.I):
+                key = (int(m.group(1)), int(m.group(2)))
+                if key in lack_eps:
+                    covered.add(key)
+                    ep_hit = True
+            if ep_hit:
+                evidence.append("单集")
+            # 季范围 S1-S5 / S01-S05（后面不带 E）
+            for m in re.finditer(r"S(\d{1,2})\s*[-~–]\s*S?(\d{1,2})(?!\d*E)", text, re.I):
+                s1, s2 = int(m.group(1)), int(m.group(2))
+                if s2 < s1:
+                    s1, s2 = s2, s1
+                for s in range(s1, s2 + 1):
+                    covered |= {(s, e) for e in seasons_lack.get(s, set())}
+                evidence.append(f"S{s1}-S{s2}")
+            # 单季 S01 / 第1季（后面不带集号、不是范围起点）
+            for m in re.finditer(
+                    r"S(\d{1,2})(?!\d*\s*[-~–E])|第\s*(\d{1,2})\s*季", text, re.I):
+                s = int(m.group(1) or m.group(2))
+                covered |= {(s, e) for e in seasons_lack.get(s, set())}
+                evidence.append(f"S{s:02d}")
+
+        if not covered:
+            return None, "覆盖未知，待入库验证"
+        return len(covered), "/".join(dict.fromkeys(evidence))
+
+    def __save_api_quota(self, quota_left: Any):
+        """持久化爱影 API 本月剩余次数（详情页统计卡展示用，与 TG 额度分开存）"""
+        try:
+            data = self.get_data(self._DATA_AIYING) or {}
+            data["api_quota_left"] = quota_left
+            data["api_updated"] = datetime.datetime.now(
+                tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT)
+            self.save_data(self._DATA_AIYING, data)
+        except Exception:
+            pass
+
+    def __aiying_api_fill(self, cand: Dict[str, Any],
+                          click_budget_left: int) -> Optional[Dict[str, Any]]:
+        """
+        爱影 HTTP API 通道尝试补齐一部剧（v1.7.0 主通道，同步方法）。
+        返回 None 表示「API 请求异常 / tg_id 不可得」，调用方回退 TG 点按钮流程；
+        否则返回 {"status": all/partial/none, "got", "clicks", "quota_left",
+                  "sa_failed", "channel": "aiying_api", "detail", "notes_brief"}。
+        clicks 计入口径：API 查询 1 次 + SA 提交每条 1 次（计入单轮爱影熔断）。
+        【风控】单剧缺集 >100 已在候选过滤阶段（max_missing）被跳过，与现有约定一致。
+        """
+        title = cand["title"]
+        tmdbid = int(cand["tmdbid"])
+        if not self._aiying_api_token:
+            logger.warning(f"【{title}】爱影 API token 未配置，回退 TG 流程")
+            return None
+        # tg_id：优先配置，其次 TG 会话自动获取；拿不到回退 TG 流程
+        tg_id, _tg_src = self.__resolve_tg_id()
+        if not tg_id:
+            logger.warning(f"【{title}】爱影 API：无法获取 tg_id（配置与 TG 会话均无），"
+                           f"回退 TG 流程")
+            return None
+
+        # ---- 1. 查询 API（异常回退 TG；明确无资源则直接转 PT，不再走 TG） ----
+        try:
+            res = self.__ay_api_query(tmdbid, tg_id)
+        except Exception as e:
+            logger.error(f"【{title}】爱影 API 请求异常（回退 TG 流程）: {e}")
+            return None
+        clicks = 1  # API 查询计 1 次
+        if res.get("quota_left") is not None:
+            self.__save_api_quota(res["quota_left"])
+        resources = res.get("resources") or []
+        none_result = {"status": "none", "got": 0, "clicks": clicks,
+                       "quota_left": res.get("quota_left"), "sa_failed": [],
+                       "channel": "aiying_api", "detail": "", "notes_brief": ""}
+        if not resources:
+            logger.info(f"【{title}】爱影 API 无本剧资源"
+                        f"（{res.get('message') or '未查询到数据'}，转 PT，不再走 TG）")
+            return none_result
+
+        # ---- 2. 选包：按缺集精确选包（v1.9.0 贪心集合覆盖 + 115 链接优先）----
+        lack_eps = {(int(s), int(e))
+                    for s, eps in cand["lack_info"].items() for e in eps}
+        # 展开「季范围/整剧」覆盖所需的季集信息：缺集季 + 资源文本里引用到的季，
+        # 逐季取 TMDB 已播出集号（失败记空列表，溢出会被低估，属可接受近似；
+        # 仅 API 查到资源的剧才会走到这里，调用量可控）
+        season_eps: Dict[int, List[int]] = {}
+        try:
+            ref_seasons = {s for s, _ in lack_eps}
+            for r in resources:
+                r_text = f"{r.get('name') or ''} {r.get('notes') or ''}"
+                ref_seasons |= {int(x) for x in
+                                re.findall(r"S(\d{1,2})", r_text, re.I)}
+            today = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).date()
+            for s in sorted(x for x in ref_seasons if 0 < x <= 40):
+                season_eps[s] = self.__get_aired_episodes(tmdbid, s, title, today)
+        except Exception as e:
+            logger.error(f"【{title}】获取季集信息用于选包失败（按无总集数近似）: {e}")
+        picks, pick_reason = self.__ay_pick_links(
+            resources, self._aiying_api_max_links, lack_eps, season_eps)
+        logger.info(f"【{title}】爱影 API 查到 {len(resources)} 条资源，"
+                    f"{pick_reason}，选中 {len(picks)} 条提交 SA 离线")
+
+        # ---- 3. 经 SA 通道提交（v1.8.0：HTTP 直连优先，失败回退 TG）----
+        items = [(f"链接{i + 1}", str(r.get("link") or ""))
+                 for i, r in enumerate(picks) if r.get("link")]
+        if not items:
+            logger.warning(f"【{title}】爱影 API 资源均无分享链接（转 PT）")
+            return none_result
+        sub = self.__sa_submit(items, title)
+        sa_via = sub.get("via", "tg")
+        clicks += len(items)  # SA 提交每条计 1 次
+        none_result["clicks"] = clicks
+        if not sub.get("ok"):
+            logger.error(f"【{title}】SA 转存提交异常：{sub.get('error')}"
+                         f"（按失败处理，转 PT）")
+            return none_result
+        results = sub.get("results") or {}
+        ok_picks = [r for i, r in enumerate(picks) if r.get("link")
+                    and (results.get(f"链接{i + 1}") or {}).get("ok")]
+        fail_msgs = [(label, (r or {}).get("msg", ""))
+                     for label, r in results.items() if not (r or {}).get("ok")]
+        for label, fmsg in fail_msgs:
+            logger.warning(f"【{title}】{label} SA 转存失败: {fmsg}")
+
+        # ---- 4. 集数覆盖（v1.9.0：用选包同款解析精确计算成功包的覆盖；
+        # 真实补齐仍以验证回环复查 Emby 入库为准） ----
+        ok_covered: Set[Tuple[int, int]] = set()
+        for r in ok_picks:
+            r_text = f"{r.get('name') or ''} {r.get('notes') or ''}"
+            ok_covered |= self.__ay_resource_cover(r_text, season_eps)
+        cover = len(ok_covered & lack_eps)
+        cover_text = f"预计覆盖 {cover}/{len(lack_eps)} 集"
+        logger.info(f"【{title}】爱影 API 提交结果：{len(ok_picks)}/{len(items)} 条成功，"
+                    f"{cover_text}")
+
+        # ---- 5. 人话明细（渠道详情记录，写历史与汇总通知用） ----
+        ok_n = len(ok_picks)
+        # v1.8.0：明细里标明 SA 走了哪条路（HTTP 提交无回执，措辞用「已提交」）
+        sa_tag = "SA(HTTP)已提交" if sa_via == "http" else "SA(TG)已提交"
+        if ok_picks:
+            first = ok_picks[0]
+            first_desc = (first.get("notes") or first.get("name") or "")[:60]
+            detail = f"《{title}》{first_desc}（{first.get('size') or '?'}G）→ {sa_tag}"
+            if ok_n < len(items):
+                first_fail = fail_msgs[0][1] if fail_msgs else "未知原因"
+                detail = (f"{ok_n}/{len(items)} 条成功，"
+                          f"失败：{first_fail[:40]}；" + detail)
+            # v1.9.0：选包理由（含预计覆盖）写入渠道明细
+            detail += f"；{pick_reason}"
+            notes_brief = (first.get("notes") or first.get("name") or "")[:40]
+        else:
+            first_fail = fail_msgs[0][1] if fail_msgs else "未知原因"
+            detail = f"0/{len(items)} 条成功，失败：{first_fail[:60]}"
+            notes_brief = ""
+
+        # 状态判定：全部链接成功且精确覆盖全部缺集才敢记 all（不再走 PT）；
+        # 有任何失败或未全覆盖一律 partial（PT 兜底，MP 只补缺集不会重复下载）
+        if ok_n == len(items) and ok_picks and cover >= len(lack_eps):
+            status, got = "all", len(lack_eps)
+        elif ok_n > 0:
+            status, got = "partial", cover
+        else:
+            status, got = "none", 0
+        return {"status": status, "got": got, "clicks": clicks,
+                "quota_left": res.get("quota_left"),
+                "sa_failed": [label for label, _ in fail_msgs],
+                "channel": "aiying_api", "detail": detail,
+                "notes_brief": notes_brief}
+
+    # ==================================================================
+    # SA HTTP 直连转存（v1.8.0 新增）：企业微信回调协议（WXBizMsgCrypt）
+    # ==================================================================
+    def __sa_http_ready(self) -> bool:
+        """SA HTTP 通道是否可用：总开关开 + pycryptodome 可用 + 关键配置齐全"""
+        return bool(self._sa_http_enabled and _CRYPTO_OK
+                    and self._sa_http_url and self._sa_http_token
+                    and self._sa_http_aeskey and self._sa_http_corpid)
+
+    def __sa_http_send(self, content: str) -> Tuple[bool, str]:
+        """
+        按企业微信回调协议向 SA 发送一条文本消息（v1.8.0，协议已实测跑通）。
+        SA 的消息 API 唯一被处理的形态就是这种加密回调——明文 POST（form/json/
+        纯文本）会被 SA 静默丢弃：返回 200 但 message 是「消息已接收」，只收不办。
+        成功判据：HTTP 200 且 JSON message == 「消息处理成功」。
+        返回 (ok, message)；网络/超时/非 200/「消息已接收」/JSON 解析异常都算失败。
+        """
+        if not _CRYPTO_OK:
+            return False, "pycryptodome 未安装"
+        try:
+            ts = str(int(time.time()))
+            nonce = "".join(random.choices("0123456789", k=10))
+            # AES-256-CBC：key = base64decode(EncodingAESKey + "=")（43 字符补一个
+            # "=" 成 32 字节），IV = key 前 16 字节
+            key = base64.b64decode(self._sa_http_aeskey + "=")
+            iv = key[:16]
+            corpid_b = self._sa_http_corpid.encode("utf-8")
+            msg_id = random.randint(10 ** 9, 10 ** 10 - 1)
+            inner_xml = (
+                f"<xml><ToUserName><![CDATA[{self._sa_http_corpid}]]></ToUserName>"
+                f"<FromUserName><![CDATA[{self._sa_http_userid}]]></FromUserName>"
+                f"<CreateTime>{ts}</CreateTime>"
+                f"<MsgType><![CDATA[text]]></MsgType>"
+                f"<Content><![CDATA[{content}]]></Content>"
+                f"<MsgId>{msg_id}</MsgId>"
+                f"<AgentID><![CDATA[{self._sa_http_agentid}]]></AgentID></xml>")
+            inner_b = inner_xml.encode("utf-8")
+            # 待加密明文 = random(16) + pack(">I", len) + inner_xml + corpid，PKCS7 补到 32 倍数
+            plain = (os.urandom(16) + struct.pack(">I", len(inner_b))
+                     + inner_b + corpid_b)
+            pad_len = 32 - (len(plain) % 32)
+            plain += bytes([pad_len]) * pad_len
+            enc_b64 = base64.b64encode(
+                _AES.new(key, _AES.MODE_CBC, iv).encrypt(plain)).decode("utf-8")
+            # msg_signature = sha1(sort(token, timestamp, nonce, enc) 拼接)
+            sig = hashlib.sha1("".join(sorted(
+                [self._sa_http_token, ts, nonce, enc_b64])).encode("utf-8")).hexdigest()
+            body_xml = (
+                f"<xml><ToUserName><![CDATA[{self._sa_http_corpid}]]></ToUserName>"
+                f"<Encrypt><![CDATA[{enc_b64}]]></Encrypt>"
+                f"<AgentID><![CDATA[{self._sa_http_agentid}]]></AgentID></xml>")
+            # 注意：URL query 里的 token=symedia 是 SA 路由标识（固定值），
+            # 与签名用的 sa_http_token 是两回事
+            resp = requests.post(
+                self._sa_http_url,
+                params={"token": "symedia", "msg_signature": sig,
+                        "timestamp": ts, "nonce": nonce},
+                data=body_xml.encode("utf-8"),
+                headers={"Content-Type": "text/xml"},
+                timeout=15)
+            self._last_sa_http_status = resp.status_code  # 联调测试 API 展示用
+            if resp.status_code != 200:
+                return False, f"HTTP {resp.status_code}: {resp.text[:100]}"
+            payload = resp.json()
+            sa_msg = str(payload.get("message") or "")
+            if payload.get("success") and sa_msg == "消息处理成功":
+                return True, sa_msg
+            # 「消息已接收」= 未被处理（明文/校验失败时 SA 也返回 200 但只收不办）
+            return False, (sa_msg or f"未知返回: {resp.text[:100]}")
+        except Exception as e:
+            self._last_sa_http_status = 0
+            return False, f"{type(e).__name__}: {e}"
+
+    def __sa_http_submit(self, items: List[Tuple[str, str]],
+                         title: str) -> Dict[str, Any]:
+        """
+        经 SA HTTP 通道提交一批链接（v1.8.0）。
+        粒度与现有 TG 提交一致：多条 ed2k 合并为一条文本，115 分享链接逐条发送。
+        返回 {"ok", "sent", "failed", "detail"}；任何一条失败整体 ok=False
+        （调用方整体回退 TG 重提，SA 对重复任务会回「任务已存在」，无副作用）。
+        不等离线结果（SA 异步处理）：统一视为「已提交待验证」，
+        由入库验证回环兜底确认——这是设计意图。
+        """
+        links = [u for _, u in items if u]
+        ed2k = [u for u in links if u.startswith("ed2k://")]
+        others = [u for u in links if not u.startswith("ed2k://")]
+        messages = others + (["\n".join(ed2k)] if ed2k else [])
+        sent, failed, fail_msg = 0, 0, ""
+        for m in messages:
+            ok, rmsg = self.__sa_http_send(m)
+            if ok:
+                sent += 1
+                logger.info(f"【{title}】SA(HTTP) 已提交 {len(m)} 字节（含 "
+                            f"{m.count('://')} 个链接）")
+            else:
+                failed += 1
+                fail_msg = rmsg
+                logger.warning(f"【{title}】SA(HTTP) 提交失败: {rmsg}")
+            time.sleep(1)   # 温和间隔，避免瞬间连发
+        ok_all = failed == 0 and sent > 0
+        detail = f"SA(HTTP)已提交 {sent} 条"
+        if failed:
+            detail += f"，失败 {failed} 条（{fail_msg[:60]}）"
+        return {"ok": ok_all, "sent": sent, "failed": failed, "detail": detail}
+
+    def __sa_submit(self, items: List[Tuple[str, str]],
+                    title: str) -> Dict[str, Any]:
+        """
+        SA 提交包装层（v1.8.0）：HTTP 直连优先，失败自动回退现有 TG 提交。
+        返回形状与 mgr.submit 对齐：{"ok", "results": {label: {ok, msg}}, "via"}，
+        via = http / tg，调用方据此在人话明细里区分 SA(HTTP)/SA(TG)。
+        """
+        if self.__sa_http_ready():
+            r = self.__sa_http_submit(items, title)
+            if r["ok"]:
+                # HTTP 提交无回执可等（SA 异步离线）：标「已提交待验证」，
+                # 由入库验证回环兜底确认；TG 会话在时用户也会收到 SA 自己的
+                # TG 通知（带外渠道），插件不再监听
+                logger.info(f"【{title}】{r['detail']}（不等离线结果，"
+                            f"交由入库验证回环确认）")
+                return {"ok": True, "via": "http",
+                        "results": {label: {"ok": True, "msg": "SA(HTTP)已提交"}
+                                    for label, _ in items}}
+            logger.warning(f"【{title}】{r['detail']}，回退 TG 提交")
+        # 回退/默认：现有 TG 提交（Telethon 发 SA 机器人并等回执）
+        mgr = self.__get_tg()
+        if not mgr:
+            return {"ok": False, "via": "tg", "error": "TG 管理器不可用",
+                    "results": {}}
+        sub = mgr.submit(self._sa_bot, items, interval=self._aiying_interval)
+        sub["via"] = "tg"
+        return sub
 
     def __unsub_pt_if_115(self, entry: Dict[str, Any], title: str,
                           history: List[Dict[str, Any]]):
@@ -2588,7 +4034,8 @@ class LackEpisodeAutoSub(_PluginBase):
         只删除本插件自己添加的订阅（username=插件名），用户手动订阅不动。
         """
         channel = entry.get("channel", "pt")
-        if channel not in ("aiying", "mixed"):
+        # v1.7.0：渠道取值扩展为 aiying_api/aiying_tg（老快照里的 aiying 也兼容）
+        if channel not in ("aiying", "aiying_api", "aiying_tg", "mixed"):
             return
         try:
             tmdbid = int(entry.get("tmdbid") or 0)
@@ -2914,6 +4361,93 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
+                    # ---- 第六行半：订阅闭环增强开关（v1.5.0 新增） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'search_after_subscribe',
+                                              'label': '订阅后立即搜索',
+                                              'hint': '订阅成功后马上让 MP 搜这一部，不用等周期搜索慢慢轮',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'verify_auto_reset',
+                                              'label': '超时自动重置订阅',
+                                              'hint': '超过告警天数未入库时重置订阅，让 MP 下轮重新搜索',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'verify_auto_resubscribe',
+                                              'label': '订阅丢失自动补订',
+                                              'hint': '订阅不存在（多为手动退订）时按剩余缺集重新订阅，默认关',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第六行又半：增量扫描（v1.6.0 新增） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'incremental_scan',
+                                              'label': '增量扫描（推荐开）',
+                                              'hint': '已完结且不缺集的剧本轮跳过，大库一轮从一小时降到几分钟',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'full_scan_weekday',
+                                        'label': '每周全量扫描日（当天忽略账本全库重查）',
+                                        'items': [
+                                            {'title': '周一', 'value': 0},
+                                            {'title': '周二', 'value': 1},
+                                            {'title': '周三', 'value': 2},
+                                            {'title': '周四', 'value': 3},
+                                            {'title': '周五', 'value': 4},
+                                            {'title': '周六', 'value': 5},
+                                            {'title': '周日', 'value': 6},
+                                        ],
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'full_scan_once',
+                                              'label': '本轮强制全量扫描',
+                                              'hint': '一次性开关：保存后下一轮忽略完结账本，跑完自动关',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
                     # ---- 第七行：磁盘告警 ----
                     {
                         'component': 'VRow',
@@ -3040,6 +4574,171 @@ class LackEpisodeAutoSub(_PluginBase):
                                               'placeholder': '例如 ColdSymMedia_bot',
                                               'hint': '填你自己 Symedia 的 TG 机器人；插件把 115/ed2k 链接发给它自动离线到 115。Symedia 转存助手配置见 symedia.top 文档',
                                               'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行半：爱影 API 通道（v1.7.0，查询主通道） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'aiying_api_enabled',
+                                              'label': '爱影 API 通道',
+                                              'hint': '查询走 HTTP API（快），异常时自动回退 TG 点按钮流程',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_api_url',
+                                              'label': '爱影 API 地址',
+                                              'placeholder': 'http://api.ayclub.vip:5050/api/user',
+                                              'hint': '一般不用改',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_api_max_links',
+                                              'label': '单剧最多提交分享链接数',
+                                              'type': 'number', 'placeholder': '3',
+                                              'hint': '整季整剧包优先，其次按大小降序',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行又半：API token 与 tg_id ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_api_token',
+                                              'label': '爱影 API token',
+                                              'placeholder': 'AY_xxxxxxxx',
+                                              'hint': '你的爱影 API 令牌，已预置；每查一次扣一次当月额度',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'tg_id',
+                                              'label': 'TG 用户 ID（可留空）',
+                                              'placeholder': '8507302878',
+                                              'hint': '留空则自动从 TG 会话获取并缓存到这里',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行又半2：SA HTTP 直连转存（v1.8.0） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'sa_http_enabled',
+                                              'label': 'SA HTTP 直连转存',
+                                              'hint': '链接直接 HTTP 提交给 SA，不再依赖 TG 机器人；失败自动回退 TG',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_url',
+                                              'label': 'SA 消息 API 地址',
+                                              'placeholder': 'http://192.168.31.40:8095/api/v1/message/',
+                                              'hint': '本地直连即可；公网地址 https://sa.hzxjyc.com/api/v1/message/ 同样可用',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_token',
+                                              'label': 'SA 回调 token',
+                                              'placeholder': 'VAVTzTajUU1c7xE6E',
+                                              'hint': '企业微信回调 token（msg_signature 签名用），已预置',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行又半3：SA HTTP 加密参数 ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_aeskey',
+                                              'label': 'EncodingAESKey',
+                                              'placeholder': '43 位 AES Key',
+                                              'hint': '企业微信回调加密密钥，已预置',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_corpid',
+                                              'label': '企业 CorpID',
+                                              'placeholder': 'ww11ddefd6f7808c86',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_userid',
+                                              'label': '来源用户 ID',
+                                              'placeholder': '8507302878',
+                                              'hint': 'SA 不校验来源',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_http_agentid',
+                                              'label': 'AgentID',
+                                              'placeholder': '1000003',
+                                              'hint': 'SA 不校验',
+                                              'persistent-hint': False}
                                 }]
                             },
                         ]
@@ -3172,7 +4871,8 @@ class LackEpisodeAutoSub(_PluginBase):
                                                 '到日志和详情页确认识别无误后，再关闭调试模式正式订阅。'
                                                 '优先级逻辑：命中「优先地区」+1 层，命中「动漫/纪录片优先」'
                                                 '各 +1 层，层级越高越先订；同层内按「同层排序规则」排序。'
-                                                '订阅后插件会每轮复查入库情况，超时未入库会告警（不自动退订）。'
+                                                '订阅后插件会每轮复查入库情况，超时未入库会告警'
+                                                '（不自动退订；开了「超时自动重置订阅」会重置订阅让 MP 重新搜索）。'
                                                 '「清空历史与已处理清单」会让所有剧重新参与订阅，请谨慎使用。'
                                     }
                                 }]
@@ -3211,6 +4911,12 @@ class LackEpisodeAutoSub(_PluginBase):
             "dead_task_auto_delete": False,
             "disk_check_path": "/video/downloads",
             "disk_alert_gb": 200,
+            "search_after_subscribe": True,
+            "verify_auto_reset": True,
+            "verify_auto_resubscribe": False,
+            "incremental_scan": True,
+            "full_scan_weekday": 6,
+            "full_scan_once": False,
             "aiying_enabled": False,
             "tg_phone": "",
             "tg_code": "",
@@ -3222,6 +4928,18 @@ class LackEpisodeAutoSub(_PluginBase):
             "sa_bot": "",
             "aiying_interval": 3,
             "aiying_max_eps": 30,
+            "aiying_api_enabled": True,
+            "aiying_api_url": "http://api.ayclub.vip:5050/api/user",
+            "aiying_api_token": "AY_66da220543a9400ea9ed9a368557d8c1",
+            "aiying_api_max_links": 3,
+            "tg_id": "",
+            "sa_http_enabled": True,
+            "sa_http_url": "http://192.168.31.40:8095/api/v1/message/",
+            "sa_http_token": "VAVTzTajUU1c7xE6E",
+            "sa_http_aeskey": "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL",
+            "sa_http_corpid": "ww11ddefd6f7808c86",
+            "sa_http_userid": "8507302878",
+            "sa_http_agentid": "1000003",
         }
 
     def get_page(self) -> List[dict]:
@@ -3231,7 +4949,21 @@ class LackEpisodeAutoSub(_PluginBase):
         processed = self.get_data(self._DATA_PROCESSED) or {}
         pending = self.get_data(self._DATA_PENDING) or {}
         dead_snapshot = self.get_data(self._DATA_DEAD) or {}
+        done_ledger = self.get_data(self._DATA_DONELEDGER) or {}  # 完结账本（v1.6.0）
         recent = list(reversed(history[-50:]))  # 最新在前
+        # v1.7.0：历史表加「渠道」列（emoji 着色：蓝 PT / 绿 115 / 橙 混合）
+        # 与「渠道详情」列（长文本截断显示；MP 页面 schema 不支持单元格 title 悬浮，
+        # 完整明细同步写在「备注」列与日志里）
+        _CHANNEL_LABEL = {"pt": "🔵 PT", "aiying_api": "🟢 115·API",
+                          "aiying_tg": "🟢 115·TG", "aiying": "🟢 115·TG",
+                          "mixed": "🟠 混合"}
+        recent_view: List[dict] = []
+        for _h in recent:
+            _row = dict(_h)
+            _row["channel_label"] = _CHANNEL_LABEL.get(_h.get("channel") or "", "")
+            _detail = _h.get("channel_detail") or ""
+            _row["detail_short"] = _detail[:50] + ("…" if len(_detail) > 50 else "")
+            recent_view.append(_row)
         now = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
 
         def __stat_card(title: str, value: Any, color: str) -> dict:
@@ -3315,7 +5047,10 @@ class LackEpisodeAutoSub(_PluginBase):
                                               f"今日剩余配额 {progress_data.get('quota_left', 0)} 部")},
                                     {'component': 'div',
                                      'props': {'class': 'text-caption text-grey'},
-                                     'text': (f"开始于 {progress_data.get('started_at', '')}。"
+                                     'text': (f"扫描模式：{'增量' if progress_data.get('scan_mode') == 'incremental' else '全量'}"
+                                              f"（完结账本跳过 {progress_data.get('ledger_skipped', 0)} 部 · "
+                                              f"账本总量 {len(done_ledger)} 部）"
+                                              f"。开始于 {progress_data.get('started_at', '')}。"
                                               f"页面不会自动刷新，重新打开本卡片即可查看最新进度。")},
                                 ]
                             },
@@ -3340,7 +5075,9 @@ class LackEpisodeAutoSub(_PluginBase):
                                      f"订阅 {progress_data.get('subscribed', 0)} 部 · "
                                      f"跳过 {progress_data.get('skipped', 0)} 部 · "
                                      f"失败 {progress_data.get('failed', 0)} 部 · "
-                                     f"耗时 {_min} 分钟")
+                                     f"耗时 {_min} 分钟 · "
+                                     f"{'增量' if progress_data.get('scan_mode') == 'incremental' else '全量'}模式"
+                                     f"（账本跳过 {progress_data.get('ledger_skipped', 0)} 部）")
                         }
                     }]
                 }]
@@ -3388,12 +5125,27 @@ class LackEpisodeAutoSub(_PluginBase):
                 })
 
         page = tg_rows + progress_rows + [
+            # ---- 静态快照提示（v1.5.0）：页面不会自动刷新 ----
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'div',
+                        'props': {'class': 'text-caption text-grey'},
+                        'text': '本页面为静态快照，执行操作或任务运行后请手动刷新查看最新状态。'
+                    }]
+                }]
+            },
             # ---- 统计卡片（两行：扫描订阅类 + 验证回环类） ----
             {
                 'component': 'VRow',
                 'content': [
                     __stat_card("累计扫描", stats.get("total_scanned", 0), "blue-grey"),
-                    __stat_card("发现缺集", stats.get("total_missing", 0), "orange"),
+                    # v1.5.0：该值每轮累加会膨胀，标题明确标注「累计」口径
+                    __stat_card("累计发现缺集（含重复轮次）",
+                                stats.get("total_missing", 0), "orange"),
                     __stat_card("累计订阅", stats.get("total_subscribed", 0), "green"),
                     __stat_card("累计跳过", stats.get("total_skipped", 0), "grey"),
                     __stat_card("累计失败", stats.get("total_failed", 0), "red"),
@@ -3406,7 +5158,24 @@ class LackEpisodeAutoSub(_PluginBase):
                     __stat_card("待验证", len(pending), "blue"),
                     __stat_card("已核销", stats.get("total_verified", 0), "teal"),
                     __stat_card("超时未补齐", stats.get("total_timeout", 0), "deep-orange"),
+                    # v1.6.0：完结账本总量（增量扫描每轮跳过的部数来源）
+                    __stat_card("完结账本", len(done_ledger), "brown"),
                 ]
+            },
+            # ---- 增量扫描规则说明（v1.6.0）----
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'div',
+                        'props': {'class': 'text-caption text-grey'},
+                        'text': ('增量扫描规则：TMDB 已完结且无缺集的剧记入「完结账本」，'
+                                 '日常轮次直接跳过不重查；发现缺集或订阅未全部成功会自动移出账本；'
+                                 '每周全量扫描日或勾「本轮强制全量扫描」时忽略账本全库重查。')
+                    }]
+                }]
             },
             # ---- 爱影统计卡片（v1.4.0，通道启用才显示）----
             *([{
@@ -3418,6 +5187,12 @@ class LackEpisodeAutoSub(_PluginBase):
                         "爱影剩余次数",
                         (self.get_data(self._DATA_AIYING) or {}).get("quota_left", "未知"),
                         "indigo"),
+                    # v1.7.0：API 通道额度（最近一次响应 times；为 0 或没查过时显示未知）
+                    __stat_card(
+                        "爱影API剩余次数",
+                        ((self.get_data(self._DATA_AIYING) or {}).get("api_quota_left")
+                         or "未知"),
+                        "deep-purple"),
                 ]
             }] if self._aiying_enabled else []),
             # ---- 上次运行时间 ----
@@ -3449,16 +5224,28 @@ class LackEpisodeAutoSub(_PluginBase):
                 except (TypeError, ValueError):
                     wait_days = 0
                 remaining_eps = sum(len(v) for v in (entry.get("remaining") or {}).values())
-                # 状态色：已告警的超时=红，等待中=蓝
+                # v1.5.0：状态列按「已等天数 vs 告警天数阈值」实时计算，
+                # 超期即显示超时，不再等下一轮复查把 alerted 置位才变红
+                is_overdue = wait_days >= self._verify_alert_days
                 verify_items.append({
                     "title": entry.get("title", ""),
                     "subscribe_time": entry.get("subscribe_time", ""),
                     "wait_days": wait_days,
                     "remaining": remaining_eps,
-                    "status": "超时未补齐" if entry.get("alerted") else "等待入库",
+                    "status": "🔴 超时未补齐" if is_overdue else "等待入库",
                 })
             # 等待天数长的排前面，最需要关注的在最上
             verify_items.sort(key=lambda x: -x["wait_days"])
+            # v1.9.1：VDataTable 在 MP 前端 v2.15.6 渲染空白，改裸 HTML 表格
+            verify_rows: List[List[Any]] = []
+            for it in verify_items[:50]:
+                if it["status"].startswith("🔴"):
+                    _st = ("raw", '<span style="color:#d32f2f;font-weight:600">'
+                                  '🔴 超时未补齐</span>')
+                else:
+                    _st = ("raw", '<span style="color:#1976d2">等待入库</span>')
+                verify_rows.append([it["title"], it["subscribe_time"],
+                                    it["wait_days"], it["remaining"], _st])
             page.append({
                 'component': 'VRow',
                 'content': [{
@@ -3476,21 +5263,21 @@ class LackEpisodeAutoSub(_PluginBase):
                                 },
                                 {
                                     'component': 'VCardText',
-                                    'content': [{
-                                        'component': 'VDataTable',
-                                        'props': {
-                                            'headers': [
-                                                {'title': '剧名', 'key': 'title', 'sortable': False},
-                                                {'title': '订阅日期', 'key': 'subscribe_time', 'sortable': False},
-                                                {'title': '已等天数', 'key': 'wait_days', 'sortable': False},
-                                                {'title': '剩余缺集', 'key': 'remaining', 'sortable': False},
-                                                {'title': '状态', 'key': 'status', 'sortable': False},
-                                            ],
-                                            'items': verify_items[:50],
-                                            'items-per-page': 50,
-                                            'density': 'compact',
+                                    'content': [
+                                        # 数据超 50 时的小提示（无分页器）
+                                        *([{
+                                            'component': 'div',
+                                            'props': {'class': 'text-caption text-grey mb-1'},
+                                            'text': f'共 {len(verify_items)} 条，显示前 50 条'
+                                        }] if len(verify_items) > 50 else []),
+                                        {
+                                            'component': 'div',
+                                            'html': _html_table(
+                                                ["剧名", "订阅日期", "已等天数",
+                                                 "剩余缺集", "状态"],
+                                                verify_rows)
                                         }
-                                    }]
+                                    ]
                                 },
                             ]
                         }
@@ -3501,6 +5288,12 @@ class LackEpisodeAutoSub(_PluginBase):
         # ---- 疑似死任务区块 ----
         dead_tasks = (dead_snapshot or {}).get("tasks") or []
         if dead_tasks:
+            # v1.9.1：裸 HTML 表格（VDataTable 渲染空白 bug 绕过）
+            dead_rows: List[List[Any]] = [
+                [t.get("name", ""), t.get("downloader", ""),
+                 t.get("age_hours", ""), t.get("state", "")]
+                for t in dead_tasks[:50]
+            ]
             page.append({
                 'component': 'VRow',
                 'content': [{
@@ -3519,20 +5312,20 @@ class LackEpisodeAutoSub(_PluginBase):
                                 },
                                 {
                                     'component': 'VCardText',
-                                    'content': [{
-                                        'component': 'VDataTable',
-                                        'props': {
-                                            'headers': [
-                                                {'title': '任务名', 'key': 'name', 'sortable': False},
-                                                {'title': '下载器', 'key': 'downloader', 'sortable': False},
-                                                {'title': '已挂时长(小时)', 'key': 'age_hours', 'sortable': False},
-                                                {'title': '状态', 'key': 'state', 'sortable': False},
-                                            ],
-                                            'items': dead_tasks[:50],
-                                            'items-per-page': 50,
-                                            'density': 'compact',
+                                    'content': [
+                                        *([{
+                                            'component': 'div',
+                                            'props': {'class': 'text-caption text-grey mb-1'},
+                                            'text': f'共 {len(dead_tasks)} 条，显示前 50 条'
+                                        }] if len(dead_tasks) > 50 else []),
+                                        {
+                                            'component': 'div',
+                                            'html': _html_table(
+                                                ["任务名", "下载器",
+                                                 "已挂时长(小时)", "状态"],
+                                                dead_rows)
                                         }
-                                    }]
+                                    ]
                                 },
                             ]
                         }
@@ -3542,29 +5335,54 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # ---- 历史表格 ----
         if recent:
+            # v1.9.1：裸 HTML 表格（VDataTable 渲染空白 bug 绕过）+ 渠道 chips 着色
+            _CHIP_TEXT = {"pt": "PT", "aiying_api": "115·API",
+                          "aiying_tg": "115·TG", "aiying": "115·TG", "mixed": "混合"}
+            _CHIP_COLOR = {"pt": "#1976d2", "aiying_api": "#2e7d32",
+                           "aiying_tg": "#2e7d32", "aiying": "#2e7d32",
+                           "mixed": "#ef6c00"}
+            history_rows: List[List[Any]] = []
+            for _h in recent_view:
+                _ch = _h.get("channel") or ""
+                if _ch in _CHIP_TEXT:
+                    _chip = ("raw", f'<span style="padding:1px 8px;border-radius:8px;'
+                                    f'font-size:11px;color:#fff;'
+                                    f'background:{_CHIP_COLOR[_ch]}">'
+                                    f'{_escape_html(_CHIP_TEXT[_ch])}</span>')
+                elif _ch:
+                    # 未知渠道值：灰色 chip 原样展示（转义后）
+                    _chip = ("raw", f'<span style="padding:1px 8px;border-radius:8px;'
+                                    f'font-size:11px;color:#fff;background:#9e9e9e">'
+                                    f'{_escape_html(_ch)}</span>')
+                else:
+                    _chip = ""
+                history_rows.append([
+                    _h.get("time", ""), _h.get("title", ""), _h.get("year", ""),
+                    _h.get("seasons", ""), _h.get("missing_count", ""),
+                    _h.get("result", ""), _chip, _h.get("detail_short", ""),
+                    _h.get("message", ""),
+                ])
             page.append({
                 'component': 'VRow',
                 'content': [{
                     'component': 'VCol',
                     'props': {'cols': 12},
-                    'content': [{
-                        'component': 'VDataTable',
-                        'props': {
-                            'headers': [
-                                {'title': '时间', 'key': 'time', 'sortable': False},
-                                {'title': '剧名', 'key': 'title', 'sortable': False},
-                                {'title': '年份', 'key': 'year', 'sortable': False},
-                                {'title': '缺集季', 'key': 'seasons', 'sortable': False},
-                                {'title': '缺集数', 'key': 'missing_count', 'sortable': False},
-                                {'title': '结果', 'key': 'result', 'sortable': False},
-                                {'title': '备注', 'key': 'message', 'sortable': False},
-                            ],
-                            'items': recent,
-                            'items-per-page': 50,
-                            'density': 'compact',
-                            'class': 'elevation-1',
+                    'content': [
+                        *([{
+                            'component': 'div',
+                            'props': {'class': 'text-caption text-grey mb-1'},
+                            'text': f'共 {len(history)} 条，显示前 50 条'
+                        }] if len(history) > 50 else []),
+                        {
+                            'component': 'div',
+                            'html': _html_table(
+                                ["时间", "剧名", "年份", "缺集季", "缺集数",
+                                 "结果", "渠道", "渠道详情", "备注"],
+                                history_rows,
+                                # 渠道详情列允许换行并限宽
+                                col_styles={7: "white-space:normal;max-width:320px"})
                         }
-                    }]
+                    ]
                 }]
             })
         else:
