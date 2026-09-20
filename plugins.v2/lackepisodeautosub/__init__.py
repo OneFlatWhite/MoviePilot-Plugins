@@ -313,22 +313,29 @@ def _html_table(headers: List[str], rows: List[List[Any]],
     col_styles: {列号: 追加的 td 样式}（如渠道详情列允许换行）。
     纯函数，不依赖 MP 环境，可独立测试。
     """
-    th_style = ("text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;"
-                "position:sticky;top:0;background:#fafafa;z-index:1")
-    td_style = "padding:5px 8px;border-bottom:1px solid #eee;vertical-align:top"
+    # v1.9.3：颜色全部改用 Vuetify 主题变量（--v-theme-on-surface/--v-border-color），
+    # 明暗主题自动适配，不再硬编码浅色（修复黑暗模式下表格发白看不清）。
+    _border = "rgba(var(--v-border-color),var(--v-border-opacity))"
+    _fg = "rgb(var(--v-theme-on-surface))"
+    th_style = (f"text-align:left;padding:6px 8px;border-bottom:2px solid {_border};"
+                f"position:sticky;top:0;background:rgb(var(--v-theme-surface));"
+                f"color:{_fg};z-index:1")
+    td_style = (f"padding:5px 8px;border-bottom:1px solid {_border};"
+                f"vertical-align:top;color:{_fg}")
     parts = [
         '<div style="overflow-x:auto;max-height:560px;overflow-y:auto">',
-        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;'
-        'white-space:nowrap">',
+        f'<table style="width:100%;border-collapse:collapse;font-size:12.5px;'
+        f'white-space:nowrap;color:{_fg};background:transparent">',
         '<thead><tr>',
     ]
     for h in headers:
         parts.append(f'<th style="{th_style}">{_escape_html(str(h))}</th>')
     parts.append('</tr></thead><tbody>')
     if not rows:
-        # 空数据：跨列居中性冷淡灰
+        # 空数据：跨列居中（主题半透灰）
         parts.append(f'<tr><td colspan="{len(headers)}" '
-                     'style="padding:16px 8px;text-align:center;color:#9e9e9e">'
+                     'style="padding:16px 8px;text-align:center;'
+                     'color:rgba(var(--v-theme-on-surface),0.5)">'
                      '暂无数据</td></tr>')
     for row in rows:
         parts.append('<tr>')
@@ -744,7 +751,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.2"
+    plugin_version = "1.9.3"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -5535,10 +5542,10 @@ class LackEpisodeAutoSub(_PluginBase):
             verify_rows: List[List[Any]] = []
             for it in verify_items[:50]:
                 if it["status"].startswith("🔴"):
-                    _st = ("raw", '<span style="color:#d32f2f;font-weight:600">'
+                    _st = ("raw", '<span style="color:#ef5350;font-weight:600">'
                                   '🔴 超时未补齐</span>')
                 else:
-                    _st = ("raw", '<span style="color:#1976d2">等待入库</span>')
+                    _st = ("raw", '<span style="color:#42a5f5">等待入库</span>')
                 verify_rows.append([it["title"], it["subscribe_time"],
                                     it["wait_days"], it["remaining"], _st])
             page.append({
@@ -5633,7 +5640,7 @@ class LackEpisodeAutoSub(_PluginBase):
             # v1.9.1：裸 HTML 表格（VDataTable 渲染空白 bug 绕过）+ 渠道 chips 着色
             _CHIP_TEXT = {"pt": "PT", "aiying_api": "115·API",
                           "aiying_tg": "115·TG", "aiying": "115·TG", "mixed": "混合"}
-            _CHIP_COLOR = {"pt": "#1976d2", "aiying_api": "#2e7d32",
+            _CHIP_COLOR = {"pt": "#1e88e5", "aiying_api": "#2e7d32",
                            "aiying_tg": "#2e7d32", "aiying": "#2e7d32",
                            "mixed": "#ef6c00"}
             history_rows: List[List[Any]] = []
