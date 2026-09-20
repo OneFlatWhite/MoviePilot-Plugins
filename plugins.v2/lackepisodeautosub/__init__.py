@@ -22,12 +22,21 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.2  SA 转存改直连 API + 公开仓库脱敏：
+          ①SA 提交新增「直连 API」最高优先级：登录拿 JWT（缓存 25 天，
+            401 自动重登重试），POST /plugin/115/offline 一次提交全部链接
+            （ed2k 与 115 分享链接同接口），目标目录自动取 folders 第一项；
+            三级回退：直连 API → 企微回调 → TG 机器人；
+          ②公开仓库脱敏：AY API 地址/token、企微回调四件套等内置默认值
+            全部清空或泛化（用户在 MP 数据库里的已存配置不受影响，
+            空值时对应通道优雅降级）；全文件中文「AY」统一命名
+          ③新增联调 API GET /sa_api_test（登录+目录检查，可真实提交一条）
   v1.9.1  修复详情页表格显示 bug：MP 前端 v2.15.6 的 VDataTable 渲染
           thead/tbody 全空（只剩分页器，后端 JSON 正常），「补齐验证/
           疑似死任务/最近历史」三个表格全部改为裸 HTML 经 v-html 渲染；
           状态列着色、渠道 chips 着色、单元格全量 HTML 转义
   v1.9.0  四项优化：
-          ①爱影 API 选包改为「按缺集精确选包」的贪心集合覆盖：逐条解析资源
+          ①AY API 选包改为「按缺集精确选包」的贪心集合覆盖：逐条解析资源
             name/notes 的集数范围（S01E06-S01E10/S1-S5/单集/全集/无标识），
             与缺集求交，无关包直接淘汰；每轮选新增有效覆盖最大的包，
             平局按 115 分享链接优先 > 溢出更小 > size 更小；
@@ -44,14 +53,14 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
             WXBizMsgCrypt：AES-256-CBC + sha1 签名；明文 POST 会被 SA 静默
             丢弃，「消息已接收」≠「消息处理成功」，后者才算成功）；
           ②TG 会话从必需降级为可选兜底：SA HTTP 通道配置齐全时，
-            TG 未登录也能走「爱影 API 查询 → HTTP 转存」全链路；
+            TG 未登录也能走「AY API 查询 → HTTP 转存」全链路；
           ③新增包装层 __sa_submit：HTTP 优先、失败自动回退 TG 提交，
             渠道明细人话区分 SA(HTTP)/SA(TG)；
           ④提交不等离线结果（SA 异步处理），统一标「已提交待验证」，
             由入库验证回环兜底确认（设计意图）；
           ⑤新增联调 API GET /sa_http_test；api_status 增加 sa_channel 字段
-  v1.7.0  爱影 HTTP API 通道 + 渠道详情记录：
-          ①爱影查询从 TG 点按钮流升级为 HTTP API 主通道（POST /api/user，
+  v1.7.0  AY HTTP API 通道 + 渠道详情记录：
+          ①AY查询从 TG 点按钮流升级为 HTTP API 主通道（POST /api/user，
             返回 115 分享链接与当月额度 times），链接经现有 SA 通道（Telethon
             发 SA 机器人）离线到 115；API 请求异常自动回退原 TG 点按钮流程，
             API 明确无资源则直接转 PT 不再走 TG；
@@ -62,7 +71,7 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
             人话明细（PT 附 sid、115 附资源 notes/大小/SA 回执），汇总通知前缀
             扩为 [PT]/[115·API]/[115·TG]/[混合]，详情页历史表新增渠道列；
           ④新增插件 API GET /ay_api_test?tmdb_id=xx&save=0/1 用于联调测试；
-          ⑤页面统计区显示「爱影API剩余次数」（取最近一次响应 times）
+          ⑤页面统计区显示「AYAPI剩余次数」（取最近一次响应 times）
   v1.6.0  新增「增量扫描」（完结账本驱动）：
           ①新增持久化「完结账本」done_ledger：只收录「TMDB 已完结(Ended/Canceled)
             且当前无缺集」的剧；扫描评估无缺集时写入（status 取同一次识别结果，
@@ -76,7 +85,7 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
             （一次性开关，跑完自动关）；「清空历史与已处理清单」连带清空账本；
           ⑤进度与页面展示扫描模式/账本跳过部数/账本总量，汇总通知带「增量跳过 X 部」
   v1.5.0  修复与闭环增强：
-          ①修复严重 bug：部分季订阅失败却整部销账（mixed 分支爱影部分成功也
+          ①修复严重 bug：部分季订阅失败却整部销账（mixed 分支AY部分成功也
             抵消 PT 失败）——现在只有全部缺集季订阅成功才写已处理清单，
             部分失败下轮重试，历史记录区分「已订阅/部分季订阅失败（附季号）」；
           ②新增「订阅后立即搜索」（默认开）：订阅成功即触发 MP 单订阅即时搜索，
@@ -90,7 +99,7 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
             尊重手动退订）；两者只处理 username=本插件名 的订阅；
           ⑥页面修正：缺集统计卡标注「累计（含重复轮次）」口径、补齐验证表
             状态列按已等天数实时计算超期、顶部加静态快照提示
-  v1.4.0  新增「爱影 115 通道」（实验功能）：
+  v1.4.0  新增「AY 115 通道」（实验功能）：
           ①插件内嵌 TG 用户态会话管理器（Telethon + 独立 daemon 线程跑 asyncio
             事件循环，同步代码经 run_coroutine_threadsafe 调用），会话文件存插件
             数据目录，Telethon 未安装/未登录时整体降级为「未启用」，绝不影响 PT 主流程；
@@ -100,7 +109,7 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
           ③新增 /tg_send_code /tg_verify /tg_status 三个登录 API，
             配置页提供一次性开关完成「发验证码/完成登录」全流程；
           ④验证回环核销时，115 渠道已补齐的剧自动退订本插件此前添加的 PT 订阅，
-            避免重复下载；通知与历史记录区分 [爱影115] / [PT下载] 来源
+            避免重复下载；通知与历史记录区分 [AY115] / [PT下载] 来源
   v1.3.2  修复严重 bug：订阅阶段与扫描阶段共用同一个超时计时，
           大库扫满超时预算后订阅阶段被秒判「超时收尾」，候选剧一部都订不出去；
           现改为订阅阶段从进入时独立计时（时长仍=配置的扫描超时分钟数）
@@ -202,7 +211,7 @@ SCAN_FREQ_OPTIONS: Dict[str, str] = {
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 # ---------------------------------------------------------------------------
-# 爱影 115 通道：TG 用户态会话（v1.4.0 新增）
+# AY 115 通道：TG 用户态会话（v1.4.0 新增）
 # ---------------------------------------------------------------------------
 
 # Telegram Desktop 官方开源公开凭证（github.com/telegramdesktop/tdesktop 源码内）
@@ -211,7 +220,7 @@ TG_API_HASH = "b18441a1ff607e10a989891a5462e627"
 # 默认代理（NAS 本地代理，Telegram 直连不可达时需要）
 TG_DEFAULT_PROXY = "http://192.168.31.40:7890"
 
-# 爱影资源列表行：🧲 [国漫] 斗罗大陆Ⅱ绝世唐门 (2023) {tmdb-228429} S01E171 4K TX WEB-DL 1.57G
+# AY资源列表行：🧲 [国漫] 斗罗大陆Ⅱ绝世唐门 (2023) {tmdb-228429} S01E171 4K TX WEB-DL 1.57G
 _AIYING_LINE_RE = re.compile(r"\{tmdb-(\d+)\}\s*S(\d+)E(\d+)\b(.*)", re.I)
 # 行尾文件大小（1.57G / 800M / 500K）
 _AIYING_SIZE_RE = re.compile(r"([\d.]+)\s*([GMK])B?\s*[-\s]*$", re.I)
@@ -224,7 +233,7 @@ _ED2K_RE = re.compile(r"ed2k://\|file\|[^\s]+")
 # 按钮文字里的季集号（兼容 S1E171 / S01E171 两种写法）
 _BTN_SE_RE = re.compile(r"S0*(\d+)E0*(\d+)", re.I)
 
-# Telethon 兜底导入：依赖未装上时插件照常加载，爱影通道整体降级为「未启用」
+# Telethon 兜底导入：依赖未装上时插件照常加载，AY通道整体降级为「未启用」
 try:
     import asyncio
     from telethon import TelegramClient
@@ -248,7 +257,7 @@ except Exception:
 
 def _parse_aiying_lines(text: str) -> List[Dict[str, Any]]:
     """
-    解析爱影资源列表文本，返回条目列表：
+    解析AY资源列表文本，返回条目列表：
       {"tmdbid": int, "season": int, "episode": int, "qrank": int, "size": float(MB)}
     qrank：画质档位（2160p/4K=3，1080p=2，720p=1，其他=0）；size 统一折算成 MB 便于比较。
     纯函数，不依赖 MP/TG 环境，可独立测试。
@@ -399,7 +408,7 @@ class _AiyingTgManager:
                 lack_eps: Set[Tuple[int, int]], max_pages: int = 5,
                 interval: int = 3, click_budget: int = 100) -> Dict[str, Any]:
         """
-        给爱影机器人发关键词，分页收集缺集条目并逐集点击按钮拿 ed2k/115 链接。
+        给AY机器人发关键词，分页收集缺集条目并逐集点击按钮拿 ed2k/115 链接。
         返回：{ok, links: {(季,集): url}, quota_left, clicks, error}
         """
         if not _TG_LIB_OK:
@@ -427,7 +436,7 @@ class _AiyingTgManager:
             return {"ok": False, "error": str(e)}
 
     def my_id(self) -> Dict[str, Any]:
-        """获取当前登录账号的 TG 用户 ID（v1.7.0，爱影 API 需要 tg_id）。
+        """获取当前登录账号的 TG 用户 ID（v1.7.0，AY API 需要 tg_id）。
         复用现有客户端连接，不单独建连；返回 {ok, tg_id, error}"""
         if not _TG_LIB_OK:
             return {"ok": False, "error": "telethon 未安装"}
@@ -644,7 +653,7 @@ class _AiyingTgManager:
                 except Exception:
                     continue
                 clicks += 1
-                # 风控：每次点击后间隔，防点爆爱影次数
+                # 风控：每次点击后间隔，防点爆AY次数
                 await asyncio.sleep(max(1, interval))
                 link = await self.__wait_link(client, bot, before_ids, timeout=15)
                 if link:
@@ -735,7 +744,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -817,34 +826,45 @@ class LackEpisodeAutoSub(_PluginBase):
     _full_scan_weekday: int = 6            # 每周全量扫描日（0=周一 ... 6=周日，默认周日）
     _full_scan_once: bool = False          # 本轮强制全量扫描（一次性，跑完自动关）
 
-    # 【爱影 115 通道】（v1.4.0 新增；默认全部兜底，Telethon 缺失时整体不启用）
-    _aiying_enabled: bool = False        # 爱影115通道开关
+    # 【AY 115 通道】（v1.4.0 新增；默认全部兜底，Telethon 缺失时整体不启用）
+    _aiying_enabled: bool = False        # AY115通道开关
     _tg_phone: str = ""                  # TG 手机号（登录你本人 TG 账号）
     _tg_code: str = ""                   # TG 验证码（一次性，保存后清空）
     _tg_password: str = ""               # TG 两步验证密码（可空）
     _tg_proxy: str = TG_DEFAULT_PROXY    # TG 代理地址
     _tg_send_code_once: bool = False     # 一次性开关：保存配置时发送验证码
     _tg_verify_once: bool = False        # 一次性开关：保存配置时完成登录
-    _aiying_bot: str = "ayclub_bot"      # 爱影资源机器人用户名
+    _aiying_bot: str = "ayclub_bot"      # AY资源机器人用户名
     _sa_bot: str = ""                    # SA 转存机器人用户名（你的 Symedia 机器人）
     _aiying_interval: int = 3            # 每集点击/发送间隔秒数（风控）
     _aiying_max_eps: int = 30            # 每剧经此通道最多补集数（风控）
 
-    # 【爱影 HTTP API 通道】（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
-    _aiying_api_enabled: bool = True     # 爱影 API 通道（主通道，异常时回退 TG 流程）
-    _aiying_api_url: str = "http://api.ayclub.vip:5050/api/user"  # 爱影 API 地址
-    _aiying_api_token: str = "AY_66da220543a9400ea9ed9a368557d8c1"  # API token（用户自己的）
+    # 【AY HTTP API 通道】（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
+    _aiying_api_enabled: bool = True     # AY API 通道（主通道，异常时回退 TG 流程）
+    # v1.9.2 脱敏：公开仓库不再内置真实服务地址与 token，请自行填写；
+    # 留空时 API 通道优雅降级回退 TG 流程（用户在 MP 数据库的已存配置不受影响）
+    _aiying_api_url: str = ""            # AY API 地址
+    _aiying_api_token: str = ""          # API token（用户自己的）
     _aiying_api_max_links: int = 3       # 单剧最多提交分享链接数
     _tg_id: str = ""                     # TG 用户 ID（API 需要；留空则从 TG 会话自动获取并缓存）
 
-    # 【SA HTTP 直连转存】（v1.8.0 新增；老配置缺字段时默认值兜底，向后兼容）
-    _sa_http_enabled: bool = True        # SA HTTP 通道总开关（False 或配置不齐则禁用回退 TG）
-    _sa_http_url: str = "http://192.168.31.40:8095/api/v1/message/"  # SA 消息 API（本地直连）
-    _sa_http_token: str = "VAVTzTajUU1c7xE6E"        # 企业微信回调 token（msg_signature 签名用）
-    _sa_http_aeskey: str = "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL"  # EncodingAESKey
-    _sa_http_corpid: str = "ww11ddefd6f7808c86"    # ToUserName/明文尾缀
-    _sa_http_userid: str = "8507302878"            # FromUserName（SA 不校验来源）
-    _sa_http_agentid: str = "1000003"              # AgentID（SA 不校验）
+    # 【SA HTTP 直连转存】（v1.8.0 新增；v1.9.2 起降级为直连 API 的兜底；
+    # 默认值已脱敏，请自行填写——用户在 MP 数据库的已存配置不受影响；
+    # token/aeskey 为空时整条企微通道自动禁用）
+    _sa_http_enabled: bool = True        # SA 企微通道总开关（False 或配置不齐则禁用）
+    _sa_http_url: str = "http://127.0.0.1:8095/api/v1/message/"  # SA 消息 API（本地直连）
+    _sa_http_token: str = ""             # 企业微信回调 token（msg_signature 签名用）
+    _sa_http_aeskey: str = ""            # EncodingAESKey
+    _sa_http_corpid: str = ""            # ToUserName/明文尾缀
+    _sa_http_userid: str = ""            # FromUserName（SA 不校验来源）
+    _sa_http_agentid: str = "1000003"    # AgentID（SA 不校验）
+
+    # 【SA 直连 API】（v1.9.2 新增，最高优先级；三件套齐全才启用，
+    # 老配置缺字段时默认值兜底，向后兼容）
+    _sa_api_url: str = "http://127.0.0.1:8095"  # SA 服务地址（本地直连）
+    _sa_api_user: str = ""               # SA 登录用户名（默认值已脱敏，请自行填写）
+    _sa_api_password: str = ""           # SA 登录密码（同上）
+    _sa_api_parent_id: str = ""          # 115 离线目标目录 cid（留空=自动取 folders 第一项）
 
     # 持久化数据的 key
     _DATA_PROCESSED = "processed"        # 已处理（已成功订阅）的剧 {tmdbid: {...}}
@@ -855,7 +875,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_DEAD = "dead_tasks"            # 最近一轮疑似死任务快照（详情页展示用）
     _DATA_PROGRESS = "progress"          # 本轮实时进度快照（详情页进度条 / API 轮询用）
     _DATA_TG_LOGIN = "tg_login"          # TG 登录状态缓存 {logged_in, username, phone, ...}
-    _DATA_AIYING = "aiying"              # 爱影通道状态 {quota_left: 本月剩余次数, updated: 时间}
+    _DATA_AIYING = "aiying"              # AY通道状态 {quota_left: 本月剩余次数, updated: 时间}
     _DATA_DONELEDGER = "done_ledger"     # 完结账本（v1.6.0）：{tmdbid(str): {"title", "archived_at"}}
 
     # ==================================================================
@@ -898,7 +918,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 logger.info(f"【{self.plugin_name}】历史记录、已处理清单与完结账本已清空")
                 self.__update_config()
 
-            # 处理「爱影115通道」TG 登录一次性开关（发验证码/完成登录）
+            # 处理「AY115通道」TG 登录一次性开关（发验证码/完成登录）
             if self._tg_send_code_once or self._tg_verify_once:
                 try:
                     self.__handle_tg_login_actions()
@@ -1014,7 +1034,7 @@ class LackEpisodeAutoSub(_PluginBase):
             config.get("full_scan_weekday"), 6)))
         self._full_scan_once = bool(config.get("full_scan_once", False))
 
-        # 爱影 115 通道（v1.4.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        # AY 115 通道（v1.4.0 新增；老配置缺字段时默认值兜底，向后兼容）
         self._aiying_enabled = bool(config.get("aiying_enabled", False))
         self._tg_phone = str(config.get("tg_phone") or "").strip()
         self._tg_code = str(config.get("tg_code") or "").strip()
@@ -1027,34 +1047,34 @@ class LackEpisodeAutoSub(_PluginBase):
         self._aiying_interval = max(1, self.__to_int(config.get("aiying_interval"), 3))
         self._aiying_max_eps = max(1, self.__to_int(config.get("aiying_max_eps"), 30))
 
-        # 爱影 HTTP API 通道（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        # AY HTTP API 通道（v1.7.0 新增；老配置缺字段时默认值兜底，向后兼容）
         self._aiying_api_enabled = bool(config.get("aiying_api_enabled", True))
-        self._aiying_api_url = str(
-            config.get("aiying_api_url")
-            or "http://api.ayclub.vip:5050/api/user").strip()
-        self._aiying_api_token = str(
-            config.get("aiying_api_token")
-            or "AY_66da220543a9400ea9ed9a368557d8c1").strip()
+        # v1.9.2 脱敏：不再内置真实地址/token，缺省为空（空值时 API 通道优雅降级）
+        self._aiying_api_url = str(config.get("aiying_api_url") or "").strip()
+        self._aiying_api_token = str(config.get("aiying_api_token") or "").strip()
         self._aiying_api_max_links = max(
             1, self.__to_int(config.get("aiying_api_max_links"), 3))
         self._tg_id = str(config.get("tg_id") or "").strip()
 
-        # SA HTTP 直连转存（v1.8.0 新增；老配置缺字段时默认值兜底，向后兼容）
+        # SA HTTP 企微通道（v1.8.0 新增；v1.9.2 起降级为直连 API 的兜底；
+        # 默认值已脱敏，四件套缺省为空——空值时企微通道自动禁用）
         self._sa_http_enabled = bool(config.get("sa_http_enabled", True))
         self._sa_http_url = str(
             config.get("sa_http_url")
-            or "http://192.168.31.40:8095/api/v1/message/").strip()
-        self._sa_http_token = str(
-            config.get("sa_http_token") or "VAVTzTajUU1c7xE6E").strip()
-        self._sa_http_aeskey = str(
-            config.get("sa_http_aeskey")
-            or "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL").strip()
-        self._sa_http_corpid = str(
-            config.get("sa_http_corpid") or "ww11ddefd6f7808c86").strip()
-        self._sa_http_userid = str(
-            config.get("sa_http_userid") or "8507302878").strip()
+            or "http://127.0.0.1:8095/api/v1/message/").strip()
+        self._sa_http_token = str(config.get("sa_http_token") or "").strip()
+        self._sa_http_aeskey = str(config.get("sa_http_aeskey") or "").strip()
+        self._sa_http_corpid = str(config.get("sa_http_corpid") or "").strip()
+        self._sa_http_userid = str(config.get("sa_http_userid") or "").strip()
         self._sa_http_agentid = str(
             config.get("sa_http_agentid") or "1000003").strip()
+
+        # SA 直连 API（v1.9.2 新增，最高优先级；三件套齐全才启用）
+        self._sa_api_url = str(
+            config.get("sa_api_url") or "http://127.0.0.1:8095").strip()
+        self._sa_api_user = str(config.get("sa_api_user") or "").strip()
+        self._sa_api_password = str(config.get("sa_api_password") or "")
+        self._sa_api_parent_id = str(config.get("sa_api_parent_id") or "").strip()
 
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
@@ -1169,6 +1189,10 @@ class LackEpisodeAutoSub(_PluginBase):
             "sa_http_corpid": self._sa_http_corpid,
             "sa_http_userid": self._sa_http_userid,
             "sa_http_agentid": self._sa_http_agentid,
+            "sa_api_url": self._sa_api_url,
+            "sa_api_user": self._sa_api_user,
+            "sa_api_password": self._sa_api_password,
+            "sa_api_parent_id": self._sa_api_parent_id,
         })
 
     def get_state(self) -> bool:
@@ -1201,7 +1225,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def stop_service(self):
         """停止一次性任务的本地调度器（cron 服务由 MP 托管，无需处理）；
-        同时优雅关闭爱影 TG 会话（下次使用自动重建连接）"""
+        同时优雅关闭AY TG 会话（下次使用自动重建连接）"""
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
@@ -1228,9 +1252,9 @@ class LackEpisodeAutoSub(_PluginBase):
         注册插件 API，挂载在 /api/v1/plugin/LackEpisodeAutoSub/ 下：
           GET /scan   手动触发一轮扫描（等价于「立即运行一次」），返回本轮摘要
           GET /status 查询当前统计（待验证/已核销/今日已订阅/今日配额等）
-          POST /tg_send_code 爱影115通道：发送 TG 登录验证码（body: {"phone": "+86..."}）
-          POST /tg_verify     爱影115通道：提交验证码完成登录（body: {"phone", "code", "password"?}）
-          GET /tg_status      爱影115通道：查询 TG 登录状态
+          POST /tg_send_code AY115通道：发送 TG 登录验证码（body: {"phone": "+86..."}）
+          POST /tg_verify     AY115通道：提交验证码完成登录（body: {"phone", "code", "password"?}）
+          GET /tg_status      AY115通道：查询 TG 登录状态
         鉴权方式 apikey：调用时带 ?apikey=你的MP_API_TOKEN
         """
         return [
@@ -1257,7 +1281,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 "methods": ["POST"],
                 "auth": "apikey",
                 "summary": "发送 TG 登录验证码",
-                "description": "爱影115通道登录第一步：body 传 {\"phone\": \"+86...\"}，"
+                "description": "AY115通道登录第一步：body 传 {\"phone\": \"+86...\"}，"
                                "验证码发到 TG 内「Telegram」官方会话（不是短信）",
             },
             {
@@ -1266,7 +1290,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 "methods": ["POST"],
                 "auth": "apikey",
                 "summary": "提交验证码完成 TG 登录",
-                "description": "爱影115通道登录第二步：body 传 {\"phone\", \"code\", \"password\"(可空)}；"
+                "description": "AY115通道登录第二步：body 传 {\"phone\", \"code\", \"password\"(可空)}；"
                                "账号开两步验证时必须带 password",
             },
             {
@@ -1282,7 +1306,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 "endpoint": self.api_ay_api_test,
                 "methods": ["GET"],
                 "auth": "apikey",
-                "summary": "爱影 HTTP API 联调测试",
+                "summary": "AY HTTP API 联调测试",
                 "description": "参数 tmdb_id（必填）+ save（0=只查询不提交，默认；1=查询并经 SA 提交第一条链接）"
                                "+ eps（可选，模拟缺集如 1:6-10;2:1-3，返回选包明细与理由）。"
                                "返回 http 状态/资源列表/选中链接/SA 回执/当前额度/tg_id 来源",
@@ -1292,9 +1316,18 @@ class LackEpisodeAutoSub(_PluginBase):
                 "endpoint": self.api_sa_http_test,
                 "methods": ["GET"],
                 "auth": "apikey",
-                "summary": "SA HTTP 直连联调测试",
+                "summary": "SA 企微通道联调测试",
                 "description": "参数 content（默认「获取当前用户 ID」）。用企业微信回调协议向 SA 发一条文本；"
                                "返回「消息处理成功」即协议握手通过，命令执行结果看 SA 的通知渠道",
+            },
+            {
+                "path": "/sa_api_test",
+                "endpoint": self.api_sa_api_test,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "SA 直连 API 联调测试",
+                "description": "执行登录+取离线目录并返回 {login_ok, folders, parent_id}；"
+                               "带 &submit=链接 时真实提交一条（会产生真实离线任务，慎用）",
             },
         ]
 
@@ -1347,11 +1380,12 @@ class LackEpisodeAutoSub(_PluginBase):
                     "total_timeout": stats.get("total_timeout", 0),    # 超时未补齐数
                     "today_subscribed": today_count,                # 今日已订阅数
                     "daily_quota": self._daily_quota,               # 今日配额
-                    # 爱影 API 本月剩余次数（最近一次响应的 times，v1.7.0）
+                    # AY API 本月剩余次数（最近一次响应的 times，v1.7.0）
                     "aiying_api_quota": (self.get_data(self._DATA_AIYING) or {})
                     .get("api_quota_left"),
-                    # 当前生效的 SA 提交通道（v1.8.0）：http/tg/none
-                    "sa_channel": ("http" if self.__sa_http_ready()
+                    # 当前生效的 SA 提交通道（v1.9.2）：api/http/tg/none
+                    "sa_channel": ("api" if self.__sa_api_ready()
+                                   else "http" if self.__sa_http_ready()
                                    else "tg" if (_TG_LIB_OK and self._sa_bot)
                                    else "none"),
                     "progress": self.get_data(self._DATA_PROGRESS) or {},  # 实时进度快照
@@ -1365,7 +1399,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _BODY_STR = Body(default="", embed=True) if Body else ""
 
     def api_tg_send_code(self, phone: str = _BODY_STR) -> Dict[str, Any]:
-        """API 端点：爱影115通道登录第一步，发送 TG 验证码"""
+        """API 端点：AY115通道登录第一步，发送 TG 验证码"""
         try:
             phone = (phone or "").strip() or self._tg_phone
             if not phone:
@@ -1375,7 +1409,7 @@ class LackEpisodeAutoSub(_PluginBase):
             mgr = self.__get_tg()
             if not mgr:
                 return {"success": False,
-                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "message": "telethon 未安装，AY通道不可用（PT 订阅不受影响）",
                         "data": None}
             res = mgr.send_code(phone)
             if res.get("ok"):
@@ -1394,7 +1428,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def api_tg_verify(self, phone: str = _BODY_STR, code: str = _BODY_STR,
                       password: str = _BODY_STR) -> Dict[str, Any]:
-        """API 端点：爱影115通道登录第二步，提交验证码（可选两步验证密码）"""
+        """API 端点：AY115通道登录第二步，提交验证码（可选两步验证密码）"""
         try:
             phone = (phone or "").strip() or self._tg_phone
             code = (code or "").strip() or self._tg_code
@@ -1406,7 +1440,7 @@ class LackEpisodeAutoSub(_PluginBase):
             mgr = self.__get_tg()
             if not mgr:
                 return {"success": False,
-                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "message": "telethon 未安装，AY通道不可用（PT 订阅不受影响）",
                         "data": None}
             res = mgr.verify(phone, code, password)
             if res.get("ok"):
@@ -1433,7 +1467,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 # telethon 未装：返回缓存状态 + 提示
                 cached = self.get_data(self._DATA_TG_LOGIN) or {}
                 return {"success": False,
-                        "message": "telethon 未安装，爱影通道不可用（PT 订阅不受影响）",
+                        "message": "telethon 未安装，AY通道不可用（PT 订阅不受影响）",
                         "data": {"logged_in": bool(cached.get("logged_in")),
                                  "username": cached.get("username", ""),
                                  "phone": cached.get("phone", "")}}
@@ -1474,7 +1508,7 @@ class LackEpisodeAutoSub(_PluginBase):
     def api_ay_api_test(self, tmdb_id: int = 0, save: int = 0,
                         eps: str = "") -> Dict[str, Any]:
         """
-        API 端点：爱影 HTTP API 联调测试（v1.7.0）。
+        API 端点：AY HTTP API 联调测试（v1.7.0）。
           save=0（默认）：只查 API，返回解析后的资源列表与额度，不提交 SA；
           save=1：查 API + 经 SA 通道提交第一条链接并返回 SA 回执（端到端联调）；
           eps（可选，v1.9.0）：模拟缺集，格式 `1:6-10;2:1-3`（S01E06-10 与
@@ -1482,7 +1516,7 @@ class LackEpisodeAutoSub(_PluginBase):
             明细与选包理由；不传时按 v1.7.0 策略选包，行为不变。
         返回 JSON 含 http 状态/资源数/选中链接/SA 回执/当前额度/tg_id 来源。
         """
-        logger.info(f"【{self.plugin_name}】收到爱影 API 联调测试请求 "
+        logger.info(f"【{self.plugin_name}】收到AY API 联调测试请求 "
                     f"tmdb_id={tmdb_id} save={save} eps={eps or '-'}")
         try:
             tmdbid = int(tmdb_id)
@@ -1500,7 +1534,7 @@ class LackEpisodeAutoSub(_PluginBase):
             res = self.__ay_api_query(tmdbid, tg_id)
         except Exception as e:
             return {"success": False,
-                    "message": f"爱影 API 请求异常: {e}",
+                    "message": f"AY API 请求异常: {e}",
                     "data": {"tg_id": tg_id, "tg_id_source": tg_src}}
         resources = res.get("resources") or []
         # v1.9.0：传入 eps 时按模拟缺集跑精确选包，否则退化为 v1.7.0 策略
@@ -1585,6 +1619,43 @@ class LackEpisodeAutoSub(_PluginBase):
                     "sa_message": msg,
                     "ok": ok,
                 }}
+
+    def api_sa_api_test(self, submit: str = "") -> Dict[str, Any]:
+        """
+        API 端点：SA 直连 API 联调测试（v1.9.2）。
+        执行登录 + 取离线目录，返回 {login_ok, folders, parent_id}；
+        带 &submit=链接 时真实提交一条（会产生真实离线任务，慎用）。
+        """
+        logger.info(f"【{self.plugin_name}】收到 SA 直连联调测试请求"
+                    f"{'（含真实提交）' if submit else ''}")
+        if not self.__sa_api_ready():
+            return {"success": False,
+                    "message": "SA 直连三件套（地址/用户名/密码）未配置齐全",
+                    "data": None}
+        token = self.__sa_api_login()
+        login_ok = bool(token)
+        folders: List[Any] = []
+        parent_id = None
+        if login_ok:
+            ok, data = self.__sa_api_request(
+                "/api/v1/plugin/115/offline/folders", method="get")
+            if ok and data:
+                folders = data.get("data") or []
+            parent_id = self.__sa_api_parent_id()
+        result: Dict[str, Any] = {
+            "login_ok": login_ok,
+            "folders": folders,
+            "parent_id": parent_id,
+            "submit_result": None,
+        }
+        # 带 submit 参数：真实提交一条链接（会产生真实离线任务）
+        if submit and parent_id:
+            r = self.__sa_api_submit([submit], "联调测试")
+            result["submit_result"] = r
+            logger.info(f"【{self.plugin_name}】联调测试真实提交结果: {r}")
+        return {"success": login_ok,
+                "message": "" if login_ok else "登录失败（详见日志）",
+                "data": result}
 
     # ==================================================================
     # 核心主流程
@@ -1715,7 +1786,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "skipped": 0,                    # 本轮跳过部数
             "failed": 0,                     # 本轮失败部数
             "sub_done": 0,                   # 订阅阶段已处理候选数
-            "aiying": 0,                     # 本轮爱影115通道补齐部数（v1.4.0）
+            "aiying": 0,                     # 本轮AY115通道补齐部数（v1.4.0）
             "ledger_skipped": 0,             # 本轮完结账本跳过部数（v1.6.0）
             "scan_mode": scan_mode,          # 本轮扫描模式 incremental/full（v1.6.0）
             "current": "",                   # 当前正在处理的剧名
@@ -1955,18 +2026,18 @@ class LackEpisodeAutoSub(_PluginBase):
         # ---------- 3.3 优先级排序 ----------
         candidates = self.__sort_candidates(candidates)
 
-        # ---------- 3.3.1 爱影115通道可用性检查（v1.4.0，每轮只查一次 TG 状态） ----------
+        # ---------- 3.3.1 AY115通道可用性检查（v1.4.0，每轮只查一次 TG 状态） ----------
         aiying_usable = False
         if not self._dry_run:
             try:
                 aiying_usable = self.__aiying_ready()
             except Exception as e:
-                logger.error(f"【{self.plugin_name}】爱影通道检测异常（不影响 PT 订阅）: {e}")
+                logger.error(f"【{self.plugin_name}】AY通道检测异常（不影响 PT 订阅）: {e}")
                 aiying_usable = False
         if aiying_usable:
-            logger.info(f"【{self.plugin_name}】爱影115通道已启用，缺集将优先尝试 115 离线")
-        aiying_clicks = 0        # 本轮爱影累计点击数（熔断用，上限 100）
-        aiying_round = 0         # 本轮爱影补齐剧数
+            logger.info(f"【{self.plugin_name}】AY115通道已启用，缺集将优先尝试 115 离线")
+        aiying_clicks = 0        # 本轮AY累计点击数（熔断用，上限 100）
+        aiying_round = 0         # 本轮AY补齐剧数
         aiying_fuse_logged = False  # 熔断提示是否已记录
 
         # ---------- 3.4 按配额 + 风控订阅 ----------
@@ -2024,10 +2095,10 @@ class LackEpisodeAutoSub(_PluginBase):
             if self._dry_run:
                 dry_msg = "调试模式未真正订阅"
                 if self._aiying_enabled and self._sa_bot:
-                    # 调试下不发任何 TG 消息，只记录爱影将尝试的集数
+                    # 调试下不发任何 TG 消息，只记录AY将尝试的集数
                     dry_try = min(cand["missing"], self._aiying_max_eps)
-                    logger.info(f"【{title}】[调试] 爱影将尝试 {dry_try} 集")
-                    dry_msg += f"；爱影将尝试 {dry_try} 集"
+                    logger.info(f"【{title}】[调试] AY将尝试 {dry_try} 集")
+                    dry_msg += f"；AY将尝试 {dry_try} 集"
                 self.__append_history(
                     history, title=title, year=cand["year"], tmdbid=cand["tmdbid"],
                     lack_info=cand["lack_info"], missing_count=cand["missing"],
@@ -2043,7 +2114,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             f"【{title}】及之后候选留待下一轮")
                 break
 
-            # ---------- 爱影115通道：MP 订阅之前优先尝试 ----------
+            # ---------- AY115通道：MP 订阅之前优先尝试 ----------
             # v1.7.0：查询主通道改为 HTTP API，TG 点按钮流程保留为兜底
             channel = "pt"   # pt / aiying_api / aiying_tg / mixed
             ok, msg = False, ""
@@ -2052,17 +2123,17 @@ class LackEpisodeAutoSub(_PluginBase):
             sid_map: Dict[int, int] = {}   # 成功季 -> sid（渠道明细用，v1.7.0）
             ay = None
             if aiying_usable:
-                # 【风控】单轮爱影总点击数熔断：超过 100 次本轮停止使用爱影，剩余走 PT
+                # 【风控】单轮AY总点击数熔断：超过 100 次本轮停止使用AY，剩余走 PT
                 # （v1.7.0：API 查询与 SA 提交也计入该计数）
                 if aiying_clicks >= 100:
                     if not aiying_fuse_logged:
                         aiying_fuse_logged = True
-                        logger.warning(f"【{self.plugin_name}】爱影本轮点击已达 100 次上限，"
+                        logger.warning(f"【{self.plugin_name}】AY本轮点击已达 100 次上限，"
                                        f"触发熔断，剩余候选全部转 PT 订阅")
                         self.__append_history(
                             history, title="（系统）", year="", tmdbid=0, lack_info={},
-                            missing_count=0, result="爱影熔断",
-                            message="本轮爱影点击超过 100 次，剩余候选转 PT")
+                            missing_count=0, result="AY熔断",
+                            message="本轮AY点击超过 100 次，剩余候选转 PT")
                 else:
                     # v1.7.0：先 HTTP API 后 TG——
                     # API 返回 None（请求异常/tg_id 不可得）才回退 TG 点按钮流程；
@@ -2073,7 +2144,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             if ay:
                                 aiying_clicks += ay.get("clicks", 0)
                         except Exception as e:
-                            logger.error(f"【{title}】爱影 API 通道异常（回退 TG 流程）: {e}")
+                            logger.error(f"【{title}】AY API 通道异常（回退 TG 流程）: {e}")
                             ay = None
                     if ay is None:
                         try:
@@ -2081,7 +2152,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             if ay:
                                 aiying_clicks += ay.get("clicks", 0)
                         except Exception as e:
-                            logger.error(f"【{title}】爱影通道异常（静默转 PT 兜底）: {e}")
+                            logger.error(f"【{title}】AY通道异常（静默转 PT 兜底）: {e}")
                             ay = None
 
             if ay and ay.get("status") == "all":
@@ -2089,7 +2160,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 ok, channel = True, ay.get("channel", "aiying_tg")
                 aiying_round += 1
                 ay_detail = ay.get("detail") or f"已提交 {ay['got']} 集到 115 离线"
-                msg = f"[爱影115] {ay_detail}"
+                msg = f"[AY115] {ay_detail}"
                 if ay.get("quota_left") is not None:
                     msg += f"（本月剩余次数 {ay['quota_left']}）"
             elif ay and ay.get("status") == "partial":
@@ -2098,22 +2169,22 @@ class LackEpisodeAutoSub(_PluginBase):
                     self.__subscribe_show(
                         title, cand["year"], cand["tmdbid"], cand["lack_info"])
                 # v1.5.0 修复：mixed 分支的成败以 PT 订阅的实际结果为准，
-                # 爱影部分成功不再抵消 PT 失败（此前无条件 ok=True，PT 失败也销账，
+                # AY部分成功不再抵消 PT 失败（此前无条件 ok=True，PT 失败也销账，
                 # 失败的季永不再补）
                 ok, channel = ok_pt, "mixed"
                 aiying_round += 1
                 ay_detail = ay.get("detail") or f"{ay['got']} 集已提交 115"
-                msg = (f"[爱影115] {ay_detail}；"
+                msg = (f"[AY115] {ay_detail}；"
                        f"剩余 {cand['missing'] - ay['got']} 集转 PT：{msg_pt}")
                 if not ok_pt:
-                    logger.warning(f"【{title}】爱影已补 {ay['got']} 集，"
+                    logger.warning(f"【{title}】AY已补 {ay['got']} 集，"
                                    f"剩余集 PT 订阅未全部成功: {msg_pt}")
             else:
-                # 爱影完全没资源/超时/异常：静默落到 MP 订阅（PT 兜底）
+                # AY完全没资源/超时/异常：静默落到 MP 订阅（PT 兜底）
                 prefix = ""
                 if aiying_usable and aiying_clicks < 100:
-                    prefix = ("爱影无资源，转 PT：" if ay is not None
-                              else "爱影通道异常，转 PT：")
+                    prefix = ("AY无资源，转 PT：" if ay is not None
+                              else "AY通道异常，转 PT：")
                 # 逐季添加订阅（MP 订阅后自己会比对媒体库只补缺集）
                 ok, succ_seasons, fail_seasons, msg_pt, sid_map = \
                     self.__subscribe_show(
@@ -2157,7 +2228,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                 (channel_detail + "；") if channel_detail else ""
                             ) + f"PT {_pt_part}"
                 # 标记已处理，下一轮不再重复
-                # v1.5.0：能走到这里说明该剧所有缺集季都订阅成功（或纯爱影补齐），
+                # v1.5.0：能走到这里说明该剧所有缺集季都订阅成功（或纯AY补齐），
                 # 部分季失败的剧走 else 分支，不会写 processed，下轮重新评估
                 processed[str(cand["tmdbid"])] = {
                     "title": title,
@@ -2239,8 +2310,8 @@ class LackEpisodeAutoSub(_PluginBase):
         stats["total_subscribed"] = stats.get("total_subscribed", 0) + subscribed
         stats["total_skipped"] = stats.get("total_skipped", 0) + skipped
         stats["total_failed"] = stats.get("total_failed", 0) + failed
-        stats["total_aiying"] = stats.get("total_aiying", 0) + aiying_round  # 累计爱影补齐
-        stats["last_aiying"] = aiying_round                                  # 本轮爱影补齐
+        stats["total_aiying"] = stats.get("total_aiying", 0) + aiying_round  # 累计AY补齐
+        stats["last_aiying"] = aiying_round                                  # 本轮AY补齐
         stats["last_run"] = start_time.strftime(TIME_FMT)
 
         self.save_data(self._DATA_PROCESSED, processed)
@@ -3252,7 +3323,7 @@ class LackEpisodeAutoSub(_PluginBase):
             logger.error(f"【{self.plugin_name}】发送汇总通知失败: {e}")
 
     # ==================================================================
-    # 爱影 115 通道（v1.4.0 新增）：TG 会话 / 登录 / 缺集补齐 / PT 退订
+    # AY 115 通道（v1.4.0 新增）：TG 会话 / 登录 / 缺集补齐 / PT 退订
     # ==================================================================
     def __get_tg(self) -> Optional[_AiyingTgManager]:
         """获取 TG 会话管理器并按当前配置初始化；Telethon 未安装时返回 None"""
@@ -3339,7 +3410,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def __aiying_ready(self) -> bool:
         """
-        爱影通道是否可用（每轮只查一次）。
+        AY通道是否可用（每轮只查一次）。
         v1.8.0 起 TG 从必需降级为可选：TG 已登录时全功能（API/TG 查询 + TG 回执）；
         TG 不可用但 SA HTTP 通道齐全且开了 API 通道时，
         「API 查询 → HTTP 转存」链路仍可用（TG 点按钮查询兜底本轮不可用）。
@@ -3366,22 +3437,22 @@ class LackEpisodeAutoSub(_PluginBase):
                     self.__persist_tg_login({"logged_in": False})
         if tg_logged_in:
             return True
-        # ---- v1.8.0：TG 不可用时，SA HTTP + 爱影 API 双齐全仍可用 ----
+        # ---- v1.8.0：TG 不可用时，SA HTTP + AY API 双齐全仍可用 ----
         if self.__sa_http_ready() and self._aiying_api_enabled:
             logger.info(f"【{self.plugin_name}】TG 不可用，但 SA HTTP 通道已配置："
-                        f"本轮爱影走「API 查询 → HTTP 转存」（TG 兜底查询不可用）")
+                        f"本轮AY走「API 查询 → HTTP 转存」（TG 兜底查询不可用）")
             return True
-        logger.warning(f"【{self.plugin_name}】爱影通道不可用：TG 未登录且 "
+        logger.warning(f"【{self.plugin_name}】AY通道不可用：TG 未登录且 "
                        f"SA HTTP 通道未配置齐全（PT 订阅不受影响）")
         return False
 
     def __aiying_fill(self, cand: Dict[str, Any],
                       click_budget_left: int) -> Optional[Dict[str, Any]]:
         """
-        爱影115通道尝试补齐一部剧（同步方法，内部经 TG 管理器提交协程）。
+        AY115通道尝试补齐一部剧（同步方法，内部经 TG 管理器提交协程）。
         返回 None 表示通道异常（调用方静默落 PT）；否则返回：
           {"status": "all"/"partial"/"none", "got": 成功集数, "clicks": 点击数,
-           "quota_left": 爱影本月剩余次数, "sa_failed": [失败集标签]}
+           "quota_left": AY本月剩余次数, "sa_failed": [失败集标签]}
         """
         mgr = self.__get_tg()
         if not mgr:
@@ -3393,7 +3464,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     for s, eps in cand["lack_info"].items() for e in eps}
         # 【风控】每剧经此通道最多补 _aiying_max_eps 集，超出部分留给 PT
         if len(lack_eps) > self._aiying_max_eps:
-            logger.info(f"【{title}】缺集 {len(lack_eps)} 集超过爱影单剧上限 "
+            logger.info(f"【{title}】缺集 {len(lack_eps)} 集超过AY单剧上限 "
                         f"{self._aiying_max_eps}，仅尝试前 {self._aiying_max_eps} 集，"
                         f"剩余转 PT")
             lack_try = set(sorted(lack_eps)[:self._aiying_max_eps])
@@ -3402,7 +3473,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # 搜索关键词：有年份发「剧名 年份」，否则发 tmdbid（机器人支持 tmdbid）
         keyword = f"{title} {cand['year']}".strip() if cand.get("year") else str(tmdbid)
-        logger.info(f"【{title}】爱影通道：向 @{self._aiying_bot} 查询「{keyword}」，"
+        logger.info(f"【{title}】AY通道：向 @{self._aiying_bot} 查询「{keyword}」，"
                     f"缺集 {len(lack_try)} 集")
 
         res = mgr.collect(self._aiying_bot, keyword, tmdbid, lack_try,
@@ -3422,12 +3493,12 @@ class LackEpisodeAutoSub(_PluginBase):
                 res = res2
 
         if not res.get("ok"):
-            logger.info(f"【{title}】爱影查询失败：{res.get('error')}（转 PT）")
+            logger.info(f"【{title}】AY查询失败：{res.get('error')}（转 PT）")
             return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
                     "quota_left": None, "sa_failed": [],
                     "channel": "aiying_tg", "detail": "", "notes_brief": ""}
 
-        # 持久化爱影本月剩余次数（详情页展示）
+        # 持久化AY本月剩余次数（详情页展示）
         if res.get("quota_left") is not None:
             try:
                 self.save_data(self._DATA_AIYING, {
@@ -3440,14 +3511,14 @@ class LackEpisodeAutoSub(_PluginBase):
 
         links: Dict[Tuple[int, int], str] = res.get("links") or {}
         if not links:
-            logger.info(f"【{title}】爱影无本剧缺集资源（转 PT）")
+            logger.info(f"【{title}】AY无本剧缺集资源（转 PT）")
             return {"status": "none", "got": 0, "clicks": int(res.get("clicks", 0)),
                     "quota_left": res.get("quota_left"), "sa_failed": [],
                     "channel": "aiying_tg", "detail": "", "notes_brief": ""}
 
         # 把拿到的 ed2k/115 链接逐条发给 SA 转存机器人
         items = [(f"S{s:02d}E{e:02d}", url) for (s, e), url in sorted(links.items())]
-        logger.info(f"【{title}】爱影拿到 {len(items)} 集链接，逐条转发给 "
+        logger.info(f"【{title}】AY拿到 {len(items)} 集链接，逐条转发给 "
                     f"@{self._sa_bot} 离线到 115")
         # v1.8.0：提交走包装层（HTTP 直连优先，失败回退 TG）
         sub = self.__sa_submit(items, title)
@@ -3473,11 +3544,12 @@ class LackEpisodeAutoSub(_PluginBase):
             status = "partial"
         else:
             status = "none"
-        logger.info(f"【{title}】爱影通道结果：{status}（成功 {got} / 缺集 "
+        logger.info(f"【{title}】AY通道结果：{status}（成功 {got} / 缺集 "
                     f"{len(lack_eps)} 集，点击 {res.get('clicks', 0)} 次）")
         # v1.7.0：TG 流程也产出人话明细（渠道详情记录），粒度保留并补充集数
-        # v1.8.0：标明 SA 走的哪条路（HTTP 提交无回执，措辞用「已提交」）
-        sa_tag = "SA(HTTP)已提交" if sa_via == "http" else "SA(TG)转存"
+        # v1.9.2：标明 SA 走的哪条路（API/企微提交无回执，措辞用「已提交」）
+        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交"}.get(
+            sa_via, "SA(TG)转存")
         tg_detail = f"TG 点按钮拿到 {len(items)} 集链接，{sa_tag} {got}/{len(items)} 集"
         if sa_failed:
             tg_detail += f"，失败 {len(sa_failed)} 集"
@@ -3487,11 +3559,11 @@ class LackEpisodeAutoSub(_PluginBase):
                 "notes_brief": f"TG 拿到 {len(items)} 集链接"}
 
     # ==================================================================
-    # 爱影 HTTP API 通道（v1.7.0 新增，主通道；TG 点按钮流程保留为兜底）
+    # AY HTTP API 通道（v1.7.0 新增，主通道；TG 点按钮流程保留为兜底）
     # ==================================================================
     def __resolve_tg_id(self) -> Tuple[Optional[str], str]:
         """
-        解析爱影 API 需要的 tg_id：优先读配置 tg_id；没有则从 TG 会话
+        解析AY API 需要的 tg_id：优先读配置 tg_id；没有则从 TG 会话
         get_me 自动获取并回写配置缓存（复用 TG 管理器现有连接，不单独建连）；
         再失败返回 (None, "")，调用方回退 TG 流程。
         返回 (tg_id, 来源)，来源为 配置/会话（联调测试 API 展示用）。
@@ -3517,12 +3589,15 @@ class LackEpisodeAutoSub(_PluginBase):
 
     def __ay_api_query(self, tmdbid: int, tg_id: str) -> Dict[str, Any]:
         """
-        调爱影 HTTP API 查询某部剧的资源（v1.7.0，协议已实测）。
+        调AY HTTP API 查询某部剧的资源（v1.7.0，协议已实测）。
         POST {tg_id, type: "tv", tmdb_id, token}，超时 15 秒；
         走 MP 全局代理（requests 默认读环境变量代理，与插件现有 HTTP 调用一致）。
         返回 {ok, resources, quota_left, http_status, message}；
         网络/超时/HTTP 错/JSON 解析错一律抛异常，由调用方决定回退 TG 流程。
         """
+        # v1.9.2 脱敏：地址缺省为空，守卫防止空 URL 请求（联调测试直接调用时）
+        if not self._aiying_api_url:
+            raise ValueError("AY API 地址未配置")
         resp = requests.post(
             self._aiying_api_url,
             json={"tg_id": str(tg_id), "type": "tv",
@@ -3753,7 +3828,7 @@ class LackEpisodeAutoSub(_PluginBase):
         return len(covered), "/".join(dict.fromkeys(evidence))
 
     def __save_api_quota(self, quota_left: Any):
-        """持久化爱影 API 本月剩余次数（详情页统计卡展示用，与 TG 额度分开存）"""
+        """持久化AY API 本月剩余次数（详情页统计卡展示用，与 TG 额度分开存）"""
         try:
             data = self.get_data(self._DATA_AIYING) or {}
             data["api_quota_left"] = quota_left
@@ -3766,22 +3841,23 @@ class LackEpisodeAutoSub(_PluginBase):
     def __aiying_api_fill(self, cand: Dict[str, Any],
                           click_budget_left: int) -> Optional[Dict[str, Any]]:
         """
-        爱影 HTTP API 通道尝试补齐一部剧（v1.7.0 主通道，同步方法）。
+        AY HTTP API 通道尝试补齐一部剧（v1.7.0 主通道，同步方法）。
         返回 None 表示「API 请求异常 / tg_id 不可得」，调用方回退 TG 点按钮流程；
         否则返回 {"status": all/partial/none, "got", "clicks", "quota_left",
                   "sa_failed", "channel": "aiying_api", "detail", "notes_brief"}。
-        clicks 计入口径：API 查询 1 次 + SA 提交每条 1 次（计入单轮爱影熔断）。
+        clicks 计入口径：API 查询 1 次 + SA 提交每条 1 次（计入单轮AY熔断）。
         【风控】单剧缺集 >100 已在候选过滤阶段（max_missing）被跳过，与现有约定一致。
         """
         title = cand["title"]
         tmdbid = int(cand["tmdbid"])
-        if not self._aiying_api_token:
-            logger.warning(f"【{title}】爱影 API token 未配置，回退 TG 流程")
+        # v1.9.2 脱敏：地址/token 缺省为空——优雅降级回退 TG，不抛异常
+        if not self._aiying_api_url or not self._aiying_api_token:
+            logger.debug(f"【{title}】AY API 地址/token 未配置，回退 TG 流程")
             return None
         # tg_id：优先配置，其次 TG 会话自动获取；拿不到回退 TG 流程
         tg_id, _tg_src = self.__resolve_tg_id()
         if not tg_id:
-            logger.warning(f"【{title}】爱影 API：无法获取 tg_id（配置与 TG 会话均无），"
+            logger.warning(f"【{title}】AY API：无法获取 tg_id（配置与 TG 会话均无），"
                            f"回退 TG 流程")
             return None
 
@@ -3789,7 +3865,7 @@ class LackEpisodeAutoSub(_PluginBase):
         try:
             res = self.__ay_api_query(tmdbid, tg_id)
         except Exception as e:
-            logger.error(f"【{title}】爱影 API 请求异常（回退 TG 流程）: {e}")
+            logger.error(f"【{title}】AY API 请求异常（回退 TG 流程）: {e}")
             return None
         clicks = 1  # API 查询计 1 次
         if res.get("quota_left") is not None:
@@ -3799,7 +3875,7 @@ class LackEpisodeAutoSub(_PluginBase):
                        "quota_left": res.get("quota_left"), "sa_failed": [],
                        "channel": "aiying_api", "detail": "", "notes_brief": ""}
         if not resources:
-            logger.info(f"【{title}】爱影 API 无本剧资源"
+            logger.info(f"【{title}】AY API 无本剧资源"
                         f"（{res.get('message') or '未查询到数据'}，转 PT，不再走 TG）")
             return none_result
 
@@ -3823,14 +3899,14 @@ class LackEpisodeAutoSub(_PluginBase):
             logger.error(f"【{title}】获取季集信息用于选包失败（按无总集数近似）: {e}")
         picks, pick_reason = self.__ay_pick_links(
             resources, self._aiying_api_max_links, lack_eps, season_eps)
-        logger.info(f"【{title}】爱影 API 查到 {len(resources)} 条资源，"
+        logger.info(f"【{title}】AY API 查到 {len(resources)} 条资源，"
                     f"{pick_reason}，选中 {len(picks)} 条提交 SA 离线")
 
         # ---- 3. 经 SA 通道提交（v1.8.0：HTTP 直连优先，失败回退 TG）----
         items = [(f"链接{i + 1}", str(r.get("link") or ""))
                  for i, r in enumerate(picks) if r.get("link")]
         if not items:
-            logger.warning(f"【{title}】爱影 API 资源均无分享链接（转 PT）")
+            logger.warning(f"【{title}】AY API 资源均无分享链接（转 PT）")
             return none_result
         sub = self.__sa_submit(items, title)
         sa_via = sub.get("via", "tg")
@@ -3856,13 +3932,14 @@ class LackEpisodeAutoSub(_PluginBase):
             ok_covered |= self.__ay_resource_cover(r_text, season_eps)
         cover = len(ok_covered & lack_eps)
         cover_text = f"预计覆盖 {cover}/{len(lack_eps)} 集"
-        logger.info(f"【{title}】爱影 API 提交结果：{len(ok_picks)}/{len(items)} 条成功，"
+        logger.info(f"【{title}】AY API 提交结果：{len(ok_picks)}/{len(items)} 条成功，"
                     f"{cover_text}")
 
         # ---- 5. 人话明细（渠道详情记录，写历史与汇总通知用） ----
         ok_n = len(ok_picks)
-        # v1.8.0：明细里标明 SA 走了哪条路（HTTP 提交无回执，措辞用「已提交」）
-        sa_tag = "SA(HTTP)已提交" if sa_via == "http" else "SA(TG)已提交"
+        # v1.9.2：明细里标明 SA 走了哪条路（API/企微提交无回执，措辞用「已提交」）
+        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交"}.get(
+            sa_via, "SA(TG)已提交")
         if ok_picks:
             first = ok_picks[0]
             first_desc = (first.get("notes") or first.get("name") or "")[:60]
@@ -3998,26 +4075,188 @@ class LackEpisodeAutoSub(_PluginBase):
             detail += f"，失败 {failed} 条（{fail_msg[:60]}）"
         return {"ok": ok_all, "sent": sent, "failed": failed, "detail": detail}
 
+    # ==================================================================
+    # SA 直连 API（v1.9.2 新增，最高优先级）：JWT 登录 + 115 离线提交
+    # ==================================================================
+    def __sa_api_ready(self) -> bool:
+        """SA 直连 API 是否可用：地址 + 用户名 + 密码三件套齐全"""
+        return bool(self._sa_api_url and self._sa_api_user
+                    and self._sa_api_password)
+
+    def __sa_api_login(self, force: bool = False) -> Optional[str]:
+        """
+        登录 SA 取 JWT（v1.9.2，协议已实测）。
+        POST {url}/api/v1/login/access-token，form 表单 username/password，
+        返回 {"access_token": ...}，JWT 约 30 天有效。
+        缓存到 plugindata（key sa_api_jwt，含 fetched_at），<25 天复用；
+        force=True 强制重登（401 重试用）。失败返回 None（只记日志）。
+        """
+        try:
+            if not force:
+                cached = self.get_data("sa_api_jwt") or {}
+                if cached.get("token") and cached.get("fetched_at"):
+                    try:
+                        fetched = datetime.datetime.strptime(
+                            cached["fetched_at"], TIME_FMT)
+                        age_days = (datetime.datetime.now() - fetched).days
+                        if age_days < 25:
+                            return cached["token"]
+                    except (TypeError, ValueError):
+                        pass
+            resp = requests.post(
+                self._sa_api_url.rstrip("/") + "/api/v1/login/access-token",
+                data={"username": self._sa_api_user,
+                      "password": self._sa_api_password},
+                timeout=15)
+            if resp.status_code != 200:
+                logger.error(f"【{self.plugin_name}】SA 直连登录失败 "
+                             f"HTTP {resp.status_code}")
+                return None
+            token = (resp.json() or {}).get("access_token")
+            if not token:
+                logger.error(f"【{self.plugin_name}】SA 直连登录返回无 access_token")
+                return None
+            self.save_data("sa_api_jwt", {
+                "token": token,
+                "fetched_at": datetime.datetime.now(
+                    tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+            })
+            logger.info(f"【{self.plugin_name}】SA 直连登录成功，"
+                        f"JWT 已缓存（约 30 天有效）")
+            return token
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】SA 直连登录异常: {e}")
+            return None
+
+    def __sa_api_request(self, path: str, json_body: Optional[dict] = None,
+                         method: str = "post") -> Tuple[bool, Optional[dict]]:
+        """
+        带 JWT 调 SA API（v1.9.2）。
+        注意：?token=/?apikey=/X-API-KEY 全部 401，必须用登录 JWT（已实测）。
+        401 时强制重登一次并重试一次；网络异常/非 200 返回 (False, None)。
+        """
+        for attempt in range(2):
+            token = self.__sa_api_login(force=(attempt == 1))
+            if not token:
+                return False, None
+            try:
+                resp = requests.request(
+                    method, self._sa_api_url.rstrip("/") + path,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=json_body, timeout=30)
+                if resp.status_code == 401 and attempt == 0:
+                    logger.warning(f"【{self.plugin_name}】SA JWT 已失效（401），"
+                                   f"强制重登并重试一次")
+                    continue
+                if resp.status_code != 200:
+                    logger.error(f"【{self.plugin_name}】SA API {path} 返回 "
+                                 f"HTTP {resp.status_code}: {resp.text[:100]}")
+                    return False, None
+                return True, resp.json()
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】SA API {path} 请求异常: {e}")
+                return False, None
+        return False, None
+
+    def __sa_api_parent_id(self) -> Optional[str]:
+        """
+        解析 115 离线目标目录 cid（v1.9.2）：配置优先；留空则取 folders
+        第一项并缓存到 plugindata（目录很少变，避免每次提交都查）。
+        """
+        if self._sa_api_parent_id:
+            return self._sa_api_parent_id
+        cached = self.get_data("sa_api_parent") or {}
+        if cached.get("cid"):
+            return cached["cid"]
+        ok, data = self.__sa_api_request(
+            "/api/v1/plugin/115/offline/folders", method="get")
+        if ok and data:
+            folders = data.get("data") or []
+            if folders and isinstance(folders[0], (list, tuple)) \
+                    and len(folders[0]) >= 2:
+                cid = str(folders[0][1])
+                try:
+                    self.save_data("sa_api_parent",
+                                   {"cid": cid, "name": str(folders[0][0])})
+                except Exception:
+                    pass
+                logger.info(f"【{self.plugin_name}】SA 离线目标目录自动选用："
+                            f"{folders[0][0]}（cid={cid}）")
+                return cid
+        logger.error(f"【{self.plugin_name}】SA 离线目标目录获取失败")
+        return None
+
+    def __sa_api_submit(self, links: List[str], title: str) -> Dict[str, Any]:
+        """
+        经 SA 直连 API 提交离线下载（v1.9.2，协议已实测）。
+        POST /api/v1/plugin/115/offline，magnets 一次提交全部链接
+        （ed2k 与 115 分享链接同接口都支持）。
+        message 判定：含「任务已存在」/「已经转存过」→ 算成功（内容已在库）；
+        含「离线成功」/「转存成功」→ 成功；其他（含「失败」字样）→ 失败。
+        message 是汇总的：汇总成功则全部 ok；判定失败整体 not ok
+        （调用方回退企微通道重提，SA 对已有任务返回「任务已存在」无副作用）。
+        返回形状与 __sa_http_submit 对齐并附 via="api"。
+        """
+        parent_id = self.__sa_api_parent_id()
+        if not parent_id:
+            return {"ok": False, "sent": 0, "failed": len(links), "via": "api",
+                    "detail": "SA(API) 目标目录获取失败"}
+        ok, resp = self.__sa_api_request(
+            "/api/v1/plugin/115/offline",
+            {"magnets": links, "parent_id": parent_id})
+        if not ok or resp is None:
+            return {"ok": False, "sent": 0, "failed": len(links), "via": "api",
+                    "detail": "SA(API) 提交请求失败（网络/鉴权）"}
+        msg = str(resp.get("message") or "")
+        # v1.9.2 修正：「任务已存在/已经转存过」优先于「失败」字样判定
+        # （SA 的回执形如「115离线下载失败：任务已存在」，实为内容已在库的成功态）
+        _already = ("任务已存在" in msg) or ("已经转存过" in msg)
+        success = bool(resp.get("success")) and (
+            _already
+            or ("失败" not in msg and (
+                ("离线成功" in msg) or ("转存成功" in msg))))
+        if success:
+            return {"ok": True, "sent": len(links), "failed": 0, "via": "api",
+                    "detail": f"SA(API)已提交 {len(links)} 条（{msg[:40]}）"}
+        return {"ok": False, "sent": 0, "failed": len(links), "via": "api",
+                "detail": f"SA(API) 提交失败：{msg[:60] or '无响应 message'}"}
+
     def __sa_submit(self, items: List[Tuple[str, str]],
                     title: str) -> Dict[str, Any]:
         """
-        SA 提交包装层（v1.8.0）：HTTP 直连优先，失败自动回退现有 TG 提交。
+        SA 提交包装层：三级回退（v1.9.2）。
+          ① sa_api 三件套齐全 → 直连 API（最高优先级）；
+          ② 失败/未配 → 企微回调通道（v1.8.0）；
+          ③ 再失败/未配 → TG 机器人提交（v1.4.0）。
         返回形状与 mgr.submit 对齐：{"ok", "results": {label: {ok, msg}}, "via"}，
-        via = http / tg，调用方据此在人话明细里区分 SA(HTTP)/SA(TG)。
+        via = api / http / tg，调用方据此在人话明细里区分
+        SA(API)/SA(企微)/SA(TG)。
         """
+        # ---- ① 直连 API ----
+        if self.__sa_api_ready():
+            links = [u for _, u in items if u]
+            r = self.__sa_api_submit(links, title)
+            if r["ok"]:
+                logger.info(f"【{title}】{r['detail']}（不等离线结果，"
+                            f"交由入库验证回环确认）")
+                return {"ok": True, "via": "api",
+                        "results": {label: {"ok": True, "msg": "SA(API)已提交"}
+                                    for label, _ in items}}
+            logger.warning(f"【{title}】{r['detail']}，回退企微通道")
+        # ---- ② 企微回调通道 ----
         if self.__sa_http_ready():
             r = self.__sa_http_submit(items, title)
             if r["ok"]:
-                # HTTP 提交无回执可等（SA 异步离线）：标「已提交待验证」，
+                # 提交无回执可等（SA 异步离线）：标「已提交待验证」，
                 # 由入库验证回环兜底确认；TG 会话在时用户也会收到 SA 自己的
                 # TG 通知（带外渠道），插件不再监听
                 logger.info(f"【{title}】{r['detail']}（不等离线结果，"
                             f"交由入库验证回环确认）")
                 return {"ok": True, "via": "http",
-                        "results": {label: {"ok": True, "msg": "SA(HTTP)已提交"}
+                        "results": {label: {"ok": True, "msg": "SA(企微)已提交"}
                                     for label, _ in items}}
             logger.warning(f"【{title}】{r['detail']}，回退 TG 提交")
-        # 回退/默认：现有 TG 提交（Telethon 发 SA 机器人并等回执）
+        # ---- ③ 回退/默认：TG 提交（Telethon 发 SA 机器人并等回执） ----
         mgr = self.__get_tg()
         if not mgr:
             return {"ok": False, "via": "tg", "error": "TG 管理器不可用",
@@ -4513,7 +4752,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
-                    # ---- 第十行：爱影115通道说明 ----
+                    # ---- 第十行：AY115通道说明 ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -4525,7 +4764,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'props': {
                                         'type': 'warning',
                                         'variant': 'tonal',
-                                        'text': '【爱影115通道】（实验功能）开启后，缺集会先问爱影资源机器人'
+                                        'text': '【AY115通道】（实验功能）开启后，缺集会先问AY资源机器人'
                                                 '拿 ed2k/115 链接，发给你的 SA 转存机器人自动离线到 115；'
                                                 '拿不到的集仍走原有 PT 订阅兜底。'
                                                 '需要：①你的 TG 账号完成下方登录；②填写你自己的 Symedia '
@@ -4537,7 +4776,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
-                    # ---- 第十一行：爱影开关 + 机器人配置 ----
+                    # ---- 第十一行：AY开关 + 机器人配置 ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -4547,7 +4786,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {'model': 'aiying_enabled',
-                                              'label': '启用爱影115通道',
+                                              'label': '启用AY115通道',
                                               'hint': '缺集优先走 115 离线，拿不到再落 PT 兜底',
                                               'persistent-hint': False}
                                 }]
@@ -4558,7 +4797,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'aiying_bot',
-                                              'label': '爱影资源机器人用户名',
+                                              'label': 'AY资源机器人用户名',
                                               'placeholder': 'ayclub_bot',
                                               'hint': '默认 ayclub_bot，不用改；不带 @',
                                               'persistent-hint': True}
@@ -4578,7 +4817,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
-                    # ---- 第十一行半：爱影 API 通道（v1.7.0，查询主通道） ----
+                    # ---- 第十一行半：AY API 通道（v1.7.0，查询主通道） ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -4588,7 +4827,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {'model': 'aiying_api_enabled',
-                                              'label': '爱影 API 通道',
+                                              'label': 'AY API 通道',
                                               'hint': '查询走 HTTP API（快），异常时自动回退 TG 点按钮流程',
                                               'persistent-hint': False}
                                 }]
@@ -4599,9 +4838,9 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'aiying_api_url',
-                                              'label': '爱影 API 地址',
-                                              'placeholder': 'http://api.ayclub.vip:5050/api/user',
-                                              'hint': '一般不用改',
+                                              'label': 'AY API 地址',
+                                              'placeholder': 'http://你的AY服务地址/api/user',
+                                              'hint': 'v1.9.2 起默认值已脱敏，请自行填写；留空则自动回退 TG 流程',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4629,9 +4868,9 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'aiying_api_token',
-                                              'label': '爱影 API token',
+                                              'label': 'AY API token',
                                               'placeholder': 'AY_xxxxxxxx',
-                                              'hint': '你的爱影 API 令牌，已预置；每查一次扣一次当月额度',
+                                              'hint': '你的 AY API 令牌（v1.9.2 起默认值已脱敏，请自行填写）；每查一次扣一次当月额度',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4642,14 +4881,66 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {'model': 'tg_id',
                                               'label': 'TG 用户 ID（可留空）',
-                                              'placeholder': '8507302878',
+                                              'placeholder': '1234567890',
                                               'hint': '留空则自动从 TG 会话获取并缓存到这里',
                                               'persistent-hint': False}
                                 }]
                             },
                         ]
                     },
-                    # ---- 第十一行又半2：SA HTTP 直连转存（v1.8.0） ----
+                    # ---- 第十一行又半1.5：SA 直连 API（v1.9.2，最高优先级） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_api_url',
+                                              'label': 'SA 服务地址（直连 API）',
+                                              'placeholder': 'http://127.0.0.1:8095',
+                                              'hint': '三件套齐全即启用直连，失败自动回退企微/TG',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_api_user',
+                                              'label': 'SA 登录用户名',
+                                              'placeholder': '你的 SA 用户名',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_api_password',
+                                              'label': 'SA 登录密码',
+                                              'type': 'password',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'sa_api_parent_id',
+                                              'label': '115 目录 cid（可留空）',
+                                              'placeholder': '留空自动取',
+                                              'hint': '留空=自动取 folders 第一项',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十一行又半2：SA 企微通道（v1.8.0；v1.9.2 起为直连兜底） ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -4659,8 +4950,8 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VSwitch',
                                     'props': {'model': 'sa_http_enabled',
-                                              'label': 'SA HTTP 直连转存',
-                                              'hint': '链接直接 HTTP 提交给 SA，不再依赖 TG 机器人；失败自动回退 TG',
+                                              'label': 'SA 企微通道（兜底）',
+                                              'hint': '企业微信回调协议提交；v1.9.2 起默认值已脱敏，请自行填写',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4671,8 +4962,8 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {'model': 'sa_http_url',
                                               'label': 'SA 消息 API 地址',
-                                              'placeholder': 'http://192.168.31.40:8095/api/v1/message/',
-                                              'hint': '本地直连即可；公网地址 https://sa.hzxjyc.com/api/v1/message/ 同样可用',
+                                              'placeholder': 'http://127.0.0.1:8095/api/v1/message/',
+                                              'hint': '本地直连即可，也可填你的 SA 公网地址',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4683,8 +4974,8 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {'model': 'sa_http_token',
                                               'label': 'SA 回调 token',
-                                              'placeholder': 'VAVTzTajUU1c7xE6E',
-                                              'hint': '企业微信回调 token（msg_signature 签名用），已预置',
+                                              'placeholder': '企业微信回调 token',
+                                              'hint': 'msg_signature 签名用；留空则企微通道禁用',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4702,7 +4993,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'props': {'model': 'sa_http_aeskey',
                                               'label': 'EncodingAESKey',
                                               'placeholder': '43 位 AES Key',
-                                              'hint': '企业微信回调加密密钥，已预置',
+                                              'hint': '企业微信回调加密密钥；留空则企微通道禁用',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4713,7 +5004,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {'model': 'sa_http_corpid',
                                               'label': '企业 CorpID',
-                                              'placeholder': 'ww11ddefd6f7808c86',
+                                              'placeholder': 'ww 开头 CorpID',
                                               'persistent-hint': False}
                                 }]
                             },
@@ -4724,7 +5015,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                     'component': 'VTextField',
                                     'props': {'model': 'sa_http_userid',
                                               'label': '来源用户 ID',
-                                              'placeholder': '8507302878',
+                                              'placeholder': '你的用户 ID',
                                               'hint': 'SA 不校验来源',
                                               'persistent-hint': False}
                                 }]
@@ -4825,7 +5116,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
-                    # ---- 第十四行：爱影风控参数 ----
+                    # ---- 第十四行：AY风控参数 ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -4835,7 +5126,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'aiying_interval',
-                                              'label': '爱影每集间隔（秒）',
+                                              'label': 'AY每集间隔（秒）',
                                               'type': 'number', 'placeholder': '3',
                                               'hint': '点按钮/发链接的间隔，太小容易被 TG 风控',
                                               'persistent-hint': True}
@@ -4847,9 +5138,9 @@ class LackEpisodeAutoSub(_PluginBase):
                                 'content': [{
                                     'component': 'VTextField',
                                     'props': {'model': 'aiying_max_eps',
-                                              'label': '每剧经爱影最多补集数',
+                                              'label': '每剧经AY最多补集数',
                                               'type': 'number', 'placeholder': '30',
-                                              'hint': '防点爆爱影次数；超出的集仍走 PT 订阅',
+                                              'hint': '防点爆AY次数；超出的集仍走 PT 订阅',
                                               'persistent-hint': True}
                                 }]
                             },
@@ -4929,17 +5220,21 @@ class LackEpisodeAutoSub(_PluginBase):
             "aiying_interval": 3,
             "aiying_max_eps": 30,
             "aiying_api_enabled": True,
-            "aiying_api_url": "http://api.ayclub.vip:5050/api/user",
-            "aiying_api_token": "AY_66da220543a9400ea9ed9a368557d8c1",
+            "aiying_api_url": "",
+            "aiying_api_token": "",
             "aiying_api_max_links": 3,
             "tg_id": "",
             "sa_http_enabled": True,
-            "sa_http_url": "http://192.168.31.40:8095/api/v1/message/",
-            "sa_http_token": "VAVTzTajUU1c7xE6E",
-            "sa_http_aeskey": "pu5UO4eKqDjjmfwKNaiCy1wlTrj8V1u6ENTfkuq4QfL",
-            "sa_http_corpid": "ww11ddefd6f7808c86",
-            "sa_http_userid": "8507302878",
+            "sa_http_url": "http://127.0.0.1:8095/api/v1/message/",
+            "sa_http_token": "",
+            "sa_http_aeskey": "",
+            "sa_http_corpid": "",
+            "sa_http_userid": "",
             "sa_http_agentid": "1000003",
+            "sa_api_url": "http://127.0.0.1:8095",
+            "sa_api_user": "",
+            "sa_api_password": "",
+            "sa_api_parent_id": "",
         }
 
     def get_page(self) -> List[dict]:
@@ -5041,7 +5336,7 @@ class LackEpisodeAutoSub(_PluginBase):
                                      'text': (f"本轮实时：发现缺集 {progress_data.get('missing', 0)} 部 · "
                                               f"候选 {progress_data.get('candidates', 0)} 部 · "
                                               f"已订阅 {progress_data.get('subscribed', 0)} 部 · "
-                                              f"爱影补齐 {progress_data.get('aiying', 0)} 部 · "
+                                              f"AY补齐 {progress_data.get('aiying', 0)} 部 · "
                                               f"跳过 {progress_data.get('skipped', 0)} 部 · "
                                               f"失败 {progress_data.get('failed', 0)} 部 · "
                                               f"今日剩余配额 {progress_data.get('quota_left', 0)} 部")},
@@ -5083,7 +5378,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 }]
             })
 
-        # ---- TG 登录状态行（v1.4.0）：爱影通道启用或登录过才显示 ----
+        # ---- TG 登录状态行（v1.4.0）：AY通道启用或登录过才显示 ----
         tg_login = self.get_data(self._DATA_TG_LOGIN) or {}
         tg_rows: List[dict] = []
         if self._aiying_enabled or tg_login:
@@ -5099,7 +5394,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             'component': 'VAlert',
                             'props': {
                                 'type': 'success', 'variant': 'tonal', 'density': 'compact',
-                                'text': (f"爱影115通道：TG 已登录（{_acc}）"
+                                'text': (f"AY115通道：TG 已登录（{_acc}）"
                                          f"{'，通道已启用' if self._aiying_enabled else '，通道未启用（到配置页打开开关）'}"
                                          f"（状态更新于 {tg_login.get('checked_at', '未知')}）")
                             }
@@ -5116,7 +5411,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             'component': 'VAlert',
                             'props': {
                                 'type': 'warning', 'variant': 'tonal', 'density': 'compact',
-                                'text': ('爱影115通道：TG 未登录。请到配置页填手机号，'
+                                'text': ('AY115通道：TG 未登录。请到配置页填手机号，'
                                          '勾「发送验证码」保存，再到 TG 收码后填验证码、'
                                          '勾「完成登录」保存；登录成功后本行会显示账号名。')
                             }
@@ -5177,19 +5472,19 @@ class LackEpisodeAutoSub(_PluginBase):
                     }]
                 }]
             },
-            # ---- 爱影统计卡片（v1.4.0，通道启用才显示）----
+            # ---- AY统计卡片（v1.4.0，通道启用才显示）----
             *([{
                 'component': 'VRow',
                 'content': [
-                    __stat_card("本轮爱影补齐", stats.get("last_aiying", 0), "cyan"),
-                    __stat_card("累计爱影补齐", stats.get("total_aiying", 0), "teal"),
+                    __stat_card("本轮AY补齐", stats.get("last_aiying", 0), "cyan"),
+                    __stat_card("累计AY补齐", stats.get("total_aiying", 0), "teal"),
                     __stat_card(
-                        "爱影剩余次数",
+                        "AY剩余次数",
                         (self.get_data(self._DATA_AIYING) or {}).get("quota_left", "未知"),
                         "indigo"),
                     # v1.7.0：API 通道额度（最近一次响应 times；为 0 或没查过时显示未知）
                     __stat_card(
-                        "爱影API剩余次数",
+                        "AYAPI剩余次数",
                         ((self.get_data(self._DATA_AIYING) or {}).get("api_quota_left")
                          or "未知"),
                         "deep-purple"),
