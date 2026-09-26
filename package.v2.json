@@ -4,11 +4,12 @@
     "release": true,
     "description": "定时扫描 Emby 剧集库找出缺集的剧，先走AY/115 秒传离线补齐（TG 会话+SA 机器人转存），没有再走 PT 订阅下载；按优先级与每日配额控制，带下载验证回环：复查入库、死任务检测、磁盘告警，115 补齐自动退订 PT，全链路闭环。",
     "labels": "订阅,补集,Emby",
-    "version": "1.9.4",
+    "version": "1.9.5",
     "icon": "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png",
     "author": "coldbrew",
     "level": 1,
     "history": {
+      "v1.9.5": "失败计数细分为 TMDB/Emby/订阅/其他并在详情页展示；AY API 请求增加目标主机、状态码、耗时与 token 脱敏日志；每轮扫描开始增加 AY 鉴权预检，失败自动回退且不影响 PT；配置页新增“测试 AY 连通性（保存即触发）”一次性开关并通知结果后自动复位",
       "v1.9.2": "SA 转存改直连 API：登录拿 JWT（缓存 25 天、401 自动重登重试），POST /plugin/115/offline 一次提交全部链接（ed2k 与 115 分享链接同接口），目标目录自动取 folders 第一项；三级回退：直连 API → 企微回调 → TG 机器人，渠道明细区分 SA(API)/SA(企微)/SA(TG)；公开仓库脱敏：AY API 地址/token 与企微四件套默认值清空或泛化（已存配置不受影响，空值优雅降级），中文「AY」统一命名；新增联调 API GET /sa_api_test",
       "v1.9.1": "修复详情页表格显示 bug：MP 前端 v2.15.6 的 VDataTable 渲染 thead/tbody 全空只剩分页器，补齐验证/疑似死任务/最近历史三个表格全部改为裸 HTML 经 v-html 渲染（状态列着色、渠道 chips 着色、单元格全量 HTML 转义、超 50 条显示条数提示、无分页器）",
       "v1.9.0": "AY API 选包改为「按缺集精确选包」贪心集合覆盖：逐条解析资源 name/notes 集数范围（S01E06-S01E10/S1-S5/单集/全集/无标识）与缺集求交，无关包淘汰，平局按 115 分享链接优先>溢出更小>size 更小，缺 2 集不再拖整季大包，选包理由写进渠道明细；部分季失败的首轮成功季纳入验证回环（快照按季合并，同剧只占一条）；即时搜索触发前探 Emby 就绪（System/Info/Public 5 秒超时+5 分钟缓存，未就绪跳过防 Emby 重启时误判整季缺失拖大包）；/ay_api_test 增加 eps 参数模拟缺集返回选包明细",

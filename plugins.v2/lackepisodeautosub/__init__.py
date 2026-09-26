@@ -22,6 +22,11 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.5  可观测性与 AY 鉴权诊断增强：
+          ①失败计数细分为 TMDB、Emby、订阅、其他并在进度页展示；
+          ②AY API 请求增加目标、状态码、耗时与脱敏 token 日志；
+          ③每轮扫描开始时执行 AY 鉴权预检，失败自动回退且不影响 PT；
+          ④配置页新增「测试 AY 连通性」保存即触发开关，通知结果后自动复位
   v1.9.4  遗留收尾：
           ①清理废弃死代码 __ay_estimate_cover（v1.7.0 估算覆盖，已被 v1.9.0
             的 __ay_resource_cover 精确选包取代，全文无调用）；
@@ -152,6 +157,7 @@ import traceback
 from threading import Event as ThreadEvent
 from typing import Any, Dict, List, Optional, Set, Tuple
 from html import escape as _escape_html
+from urllib.parse import urlparse
 
 import pytz
 import requests
@@ -762,7 +768,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.4"
+    plugin_version = "1.9.5"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -865,6 +871,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _aiying_api_token: str = ""          # API token（用户自己的）
     _aiying_api_max_links: int = 3       # 单剧最多提交分享链接数
     _tg_id: str = ""                     # TG 用户 ID（API 需要；留空则从 TG 会话自动获取并缓存）
+    _ay_api_probe_once: bool = False     # 一次性开关：保存配置时测试 AY API 连通性
 
     # 【SA HTTP 直连转存】（v1.8.0 新增；v1.9.2 起降级为直连 API 的兜底；
     # 默认值已脱敏，请自行填写——用户在 MP 数据库的已存配置不受影响；
@@ -942,6 +949,29 @@ class LackEpisodeAutoSub(_PluginBase):
                     self.__handle_tg_login_actions()
                 except Exception as e:
                     logger.error(f"【{self.plugin_name}】TG 登录动作处理失败（不影响主流程）: {e}")
+
+            # 处理「测试 AY 连通性」一次性开关（保存即触发，通知后自动复位）
+            if self._ay_api_probe_once:
+                try:
+                    probe = self.__ay_probe()
+                    probe_text = {
+                        "ok": "AY 连通性测试：✅ 通过",
+                        "401": ("AY 连通性测试：❌ 鉴权失败 401（可能 IP/token 未授权，"
+                                "需联系管理员加白名单）"),
+                        "disabled": "AY 连通性测试：未启用或配置不完整",
+                        "error": f"AY 连通性测试：异常（{probe.get('message') or '未知错误'}）",
+                    }.get(probe.get("result"), "AY 连通性测试：异常（未知结果）")
+                    logger.info(f"【{self.plugin_name}】{probe_text}")
+                    self.post_message(
+                        mtype=NotificationType.SiteMessage,
+                        title=f"【{self.plugin_name}】AY 连通性测试",
+                        text=probe_text,
+                    )
+                except Exception as e:
+                    logger.error(f"【{self.plugin_name}】AY 连通性测试通知失败（不影响主流程）: {e}")
+                finally:
+                    self._ay_api_probe_once = False
+                    self.__update_config()
 
             # 「立即运行一次」：用本地调度器 3 秒后触发一次，与 cron 服务互不影响
             if self._onlyonce:
@@ -1073,6 +1103,7 @@ class LackEpisodeAutoSub(_PluginBase):
         self._aiying_api_max_links = max(
             1, self.__to_int(config.get("aiying_api_max_links"), 3))
         self._tg_id = str(config.get("tg_id") or "").strip()
+        self._ay_api_probe_once = bool(config.get("ay_api_probe_once", False))
 
         # SA HTTP 企微通道（v1.8.0 新增；v1.9.2 起降级为直连 API 的兜底；
         # 默认值已脱敏，四件套缺省为空——空值时企微通道自动禁用）
@@ -1200,6 +1231,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "aiying_api_token": self._aiying_api_token,
             "aiying_api_max_links": self._aiying_api_max_links,
             "tg_id": self._tg_id,
+            "ay_api_probe_once": self._ay_api_probe_once,
             "sa_http_enabled": self._sa_http_enabled,
             "sa_http_url": self._sa_http_url,
             "sa_http_token": self._sa_http_token,
@@ -1749,6 +1781,10 @@ class LackEpisodeAutoSub(_PluginBase):
         subscribed = 0     # 本轮新增订阅数
         skipped = 0        # 跳过数（关键词/超限/已订阅/已处理）
         failed = 0         # 识别/请求/订阅失败数
+        failed_tmdb = 0    # TMDB 识别/请求失败数
+        failed_emby = 0    # Emby 季集读取失败数
+        failed_sub = 0     # 订阅失败数
+        failed_other = 0   # 单剧其他处理异常数
         subscribed_titles: List[str] = []   # 本轮订阅成功的剧名（通知用）
         timeout_hit = False      # 是否触发扫描超时收尾
         circuit_broken = False   # 是否触发连续失败熔断
@@ -1790,6 +1826,20 @@ class LackEpisodeAutoSub(_PluginBase):
                             else "本轮强制全量")
             logger.info(f"【{self.plugin_name}】扫描模式：全量（{_full_reason}）")
 
+        # ---------- AY API 鉴权预检（v1.9.5；失败不阻断 PT/TG 兜底）----------
+        ay_precheck = self.__ay_probe()
+        ay_api_precheck_ok = ay_precheck.get("result") == "ok"
+        if ay_precheck.get("result") == "ok":
+            logger.info(f"【{self.plugin_name}】AY 鉴权预检通过")
+        elif ay_precheck.get("result") == "401":
+            logger.warning(f"【{self.plugin_name}】AY 鉴权预检失败：token/IP 授权失效(401)，"
+                           f"本轮 AY 通道将不可用，自动回退")
+        elif ay_precheck.get("result") == "disabled":
+            logger.info(f"【{self.plugin_name}】AY 通道未启用，跳过预检")
+        else:
+            logger.warning(f"【{self.plugin_name}】AY API 预检异常："
+                           f"{ay_precheck.get('message') or '未知错误'}")
+
         # ---------- 实时进度快照初始化（v1.3.0）----------
         progress: Dict[str, Any] = {
             "running": True,                 # 是否正在跑
@@ -1802,10 +1852,15 @@ class LackEpisodeAutoSub(_PluginBase):
             "subscribed": 0,                 # 本轮已订阅部数
             "skipped": 0,                    # 本轮跳过部数
             "failed": 0,                     # 本轮失败部数
+            "failed_tmdb": 0,                # TMDB 失败部数（v1.9.5）
+            "failed_emby": 0,                # Emby 失败部数（v1.9.5）
+            "failed_sub": 0,                 # 订阅失败部数（v1.9.5）
+            "failed_other": 0,               # 其他失败部数（v1.9.5）
             "sub_done": 0,                   # 订阅阶段已处理候选数
             "aiying": 0,                     # 本轮AY115通道补齐部数（v1.4.0）
             "ledger_skipped": 0,             # 本轮完结账本跳过部数（v1.6.0）
             "scan_mode": scan_mode,          # 本轮扫描模式 incremental/full（v1.6.0）
+            "ay_precheck": ay_precheck.get("result", "error"),  # AY API 预检结果（v1.9.5）
             "current": "",                   # 当前正在处理的剧名
             "quota_left": remaining_quota,   # 当日剩余配额
             "percent": 0,
@@ -1915,6 +1970,10 @@ class LackEpisodeAutoSub(_PluginBase):
                     progress["candidates"] = len(candidates)
                     progress["skipped"] = skipped
                     progress["failed"] = failed
+                    progress["failed_tmdb"] = failed_tmdb
+                    progress["failed_emby"] = failed_emby
+                    progress["failed_sub"] = failed_sub
+                    progress["failed_other"] = failed_other
                     progress["ledger_skipped"] = ledger_skipped
                     progress["percent"] = self.__calc_percent(progress)
                     if scanned % 10 == 0:
@@ -1960,6 +2019,7 @@ class LackEpisodeAutoSub(_PluginBase):
                         except Exception as e:
                             logger.error(f"【{title}】获取 Emby 季集信息失败: {e}")
                             failed += 1
+                            failed_emby += 1
                             continue
 
                         # ---- 3.2 对比 TMDB 得出缺集（同时拿回 mediainfo 供优先级判定） ----
@@ -1968,6 +2028,7 @@ class LackEpisodeAutoSub(_PluginBase):
                         if lack_info is None:
                             # 识别/TMDB 请求失败
                             failed += 1
+                            failed_tmdb += 1
                             continue
                         if not lack_info:
                             # 不缺集
@@ -2034,6 +2095,7 @@ class LackEpisodeAutoSub(_PluginBase):
                         # 单部剧处理异常不中断整轮
                         logger.error(f"【{title}】处理出错: {e}")
                         failed += 1
+                        failed_other += 1
                         continue
 
         logger.info(f"【{self.plugin_name}】扫描完成：共扫描 {scanned} 部剧，"
@@ -2155,7 +2217,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     # v1.7.0：先 HTTP API 后 TG——
                     # API 返回 None（请求异常/tg_id 不可得）才回退 TG 点按钮流程；
                     # API 明确「无资源」（status=none）时不再走 TG，直接转 PT
-                    if self._aiying_api_enabled:
+                    if self._aiying_api_enabled and ay_api_precheck_ok:
                         try:
                             ay = self.__aiying_api_fill(cand, 100 - aiying_clicks)
                             if ay:
@@ -2266,8 +2328,13 @@ class LackEpisodeAutoSub(_PluginBase):
                     channel=channel, channel_detail=channel_detail)
             else:
                 failed += 1
+                failed_sub += 1
                 consecutive_failures += 1
                 progress["failed"] = failed
+                progress["failed_tmdb"] = failed_tmdb
+                progress["failed_emby"] = failed_emby
+                progress["failed_sub"] = failed_sub
+                progress["failed_other"] = failed_other
                 progress["sub_done"] = index + 1
                 progress["percent"] = self.__calc_percent(progress)
                 self.__save_progress(progress)
@@ -2327,6 +2394,10 @@ class LackEpisodeAutoSub(_PluginBase):
         stats["total_subscribed"] = stats.get("total_subscribed", 0) + subscribed
         stats["total_skipped"] = stats.get("total_skipped", 0) + skipped
         stats["total_failed"] = stats.get("total_failed", 0) + failed
+        stats["total_failed_tmdb"] = stats.get("total_failed_tmdb", 0) + failed_tmdb
+        stats["total_failed_emby"] = stats.get("total_failed_emby", 0) + failed_emby
+        stats["total_failed_sub"] = stats.get("total_failed_sub", 0) + failed_sub
+        stats["total_failed_other"] = stats.get("total_failed_other", 0) + failed_other
         stats["total_aiying"] = stats.get("total_aiying", 0) + aiying_round  # 累计AY补齐
         stats["last_aiying"] = aiying_round                                  # 本轮AY补齐
         stats["last_run"] = start_time.strftime(TIME_FMT)
@@ -2346,6 +2417,8 @@ class LackEpisodeAutoSub(_PluginBase):
             "scanned": scanned, "missing": missing_shows,
             "candidates": len(candidates), "subscribed": subscribed,
             "skipped": skipped, "failed": failed,
+            "failed_tmdb": failed_tmdb, "failed_emby": failed_emby,
+            "failed_sub": failed_sub, "failed_other": failed_other,
             "aiying": aiying_round,
             "ledger_skipped": ledger_skipped,
             "scan_mode": scan_mode,
@@ -3604,6 +3677,41 @@ class LackEpisodeAutoSub(_PluginBase):
         logger.warning(f"【{self.plugin_name}】获取 tg_id 失败: {res.get('error')}")
         return None, ""
 
+    def __ay_probe(self) -> Dict[str, Any]:
+        """探测 AY API 连通性与鉴权状态；任何异常都转换为结果字典。"""
+        start = time.monotonic()
+        try:
+            if not (self._aiying_enabled and self._aiying_api_enabled
+                    and self._aiying_api_url and self._aiying_api_token):
+                return {"result": "disabled", "status": None,
+                        "message": "AY API 未启用或配置不完整", "elapsed": 0.0}
+            tg_id, _ = self.__resolve_tg_id()
+            token = self._aiying_api_token or ""
+            mask = token[:4] + "****" if len(token) > 4 else "****"
+            target = urlparse(self._aiying_api_url).hostname or self._aiying_api_url
+            logger.info(f"AY API 预检请求已发出 → 目标 {target}，tmdb_id=1")
+            resp = requests.post(
+                self._aiying_api_url,
+                json={"tg_id": str(tg_id or "0"), "type": "tv",
+                      "tmdb_id": "1", "token": self._aiying_api_token},
+                timeout=10)
+            elapsed = time.monotonic() - start
+            logger.info(f"AY API 预检响应 ← 状态码 {resp.status_code}，"
+                        f"耗时 {elapsed:.2f}s，token={mask}")
+            if resp.status_code == 200:
+                return {"result": "ok", "status": 200,
+                        "message": "连接与鉴权正常", "elapsed": elapsed}
+            if resp.status_code == 401:
+                return {"result": "401", "status": 401,
+                        "message": "token/IP 授权失效", "elapsed": elapsed}
+            return {"result": "error", "status": resp.status_code,
+                    "message": f"HTTP {resp.status_code}", "elapsed": elapsed}
+        except Exception as e:
+            elapsed = time.monotonic() - start
+            logger.warning(f"AY API 预检异常：{e}，耗时 {elapsed:.2f}s")
+            return {"result": "error", "status": None,
+                    "message": str(e), "elapsed": elapsed}
+
     def __ay_api_query(self, tmdbid: int, tg_id: str) -> Dict[str, Any]:
         """
         调AY HTTP API 查询某部剧的资源（v1.7.0，协议已实测）。
@@ -3615,11 +3723,19 @@ class LackEpisodeAutoSub(_PluginBase):
         # v1.9.2 脱敏：地址缺省为空，守卫防止空 URL 请求（联调测试直接调用时）
         if not self._aiying_api_url:
             raise ValueError("AY API 地址未配置")
+        start = time.monotonic()
+        target = urlparse(self._aiying_api_url).hostname or self._aiying_api_url
+        logger.info(f"AY API 请求已发出 → 目标 {target}，tmdb_id={tmdbid}")
         resp = requests.post(
             self._aiying_api_url,
             json={"tg_id": str(tg_id), "type": "tv",
                   "tmdb_id": str(tmdbid), "token": self._aiying_api_token},
             timeout=15)
+        elapsed = time.monotonic() - start
+        token = self._aiying_api_token or ""
+        mask = token[:4] + "****" if len(token) > 4 else "****"
+        logger.info(f"AY API 响应 ← 状态码 {resp.status_code}，"
+                    f"耗时 {elapsed:.2f}s，token={mask}")
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data")
@@ -4851,7 +4967,22 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
-                    # ---- 第十一行又半1.5：SA 直连 API（v1.9.2，最高优先级） ----
+                    # ---- 第十一行又半1.5：AY API 连通性测试（v1.9.5） ----
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12},
+                            'content': [{
+                                'component': 'VSwitch',
+                                'props': {'model': 'ay_api_probe_once',
+                                          'label': '测试 AY 连通性（保存即触发）',
+                                          'hint': '打开并保存后立即探测 AY API 是否连通，结果见通知与插件日志，随后自动复位',
+                                          'persistent-hint': False}
+                            }]
+                        }]
+                    },
+                    # ---- 第十一行又半2：SA 直连 API（v1.9.2，最高优先级） ----
                     {
                         'component': 'VRow',
                         'content': [
@@ -5187,6 +5318,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "aiying_api_token": "",
             "aiying_api_max_links": 3,
             "tg_id": "",
+            "ay_api_probe_once": False,
             "sa_http_enabled": True,
             "sa_http_url": "http://127.0.0.1:8095/api/v1/message/",
             "sa_http_token": "",
@@ -5250,6 +5382,9 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # ---- 实时进度卡片（v1.3.0）：扫描没跑完也能看到数字与进度条 ----
         progress_data = self.get_data(self._DATA_PROGRESS) or {}
+        _ay_precheck_label = {
+            "ok": "通过", "401": "401 失效", "disabled": "未启用", "error": "异常",
+        }.get(progress_data.get("ay_precheck"), "未知")
         progress_rows: List[dict] = []
         if progress_data.get("running"):
             _pct = int(progress_data.get("percent", 0))
@@ -5300,8 +5435,13 @@ class LackEpisodeAutoSub(_PluginBase):
                                               f"候选 {progress_data.get('candidates', 0)} 部 · "
                                               f"已订阅 {progress_data.get('subscribed', 0)} 部 · "
                                               f"AY补齐 {progress_data.get('aiying', 0)} 部 · "
+                                              f"AY预检：{_ay_precheck_label} · "
                                               f"跳过 {progress_data.get('skipped', 0)} 部 · "
-                                              f"失败 {progress_data.get('failed', 0)} 部 · "
+                                              f"失败 {progress_data.get('failed', 0)} 部（"
+                                              f"TMDB {progress_data.get('failed_tmdb', 0)} · "
+                                              f"Emby {progress_data.get('failed_emby', 0)} · "
+                                              f"订阅 {progress_data.get('failed_sub', 0)} · "
+                                              f"其他 {progress_data.get('failed_other', 0)}） · "
                                               f"今日剩余配额 {progress_data.get('quota_left', 0)} 部")},
                                     {'component': 'div',
                                      'props': {'class': 'text-caption text-grey'},
@@ -5332,7 +5472,11 @@ class LackEpisodeAutoSub(_PluginBase):
                                      f"发现缺集 {progress_data.get('missing', 0)} 部 · "
                                      f"订阅 {progress_data.get('subscribed', 0)} 部 · "
                                      f"跳过 {progress_data.get('skipped', 0)} 部 · "
-                                     f"失败 {progress_data.get('failed', 0)} 部 · "
+                                     f"失败 {progress_data.get('failed', 0)} 部（"
+                                     f"TMDB {progress_data.get('failed_tmdb', 0)} · "
+                                     f"Emby {progress_data.get('failed_emby', 0)} · "
+                                     f"订阅 {progress_data.get('failed_sub', 0)} · "
+                                     f"其他 {progress_data.get('failed_other', 0)}） · "
                                      f"耗时 {_min} 分钟 · "
                                      f"{'增量' if progress_data.get('scan_mode') == 'incremental' else '全量'}模式"
                                      f"（账本跳过 {progress_data.get('ledger_skipped', 0)} 部）")
