@@ -22,6 +22,17 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.4  遗留收尾：
+          ①清理废弃死代码 __ay_estimate_cover（v1.7.0 估算覆盖，已被 v1.9.0
+            的 __ay_resource_cover 精确选包取代，全文无调用）；
+          ②联调 API GET /ay_api_test?save=1 提交改走 __sa_submit 三级回退
+            （直连 API → 企微 → TG），与主流程一致；sa_result 增加 via 通道字段
+  v1.9.3  详情页明暗主题适配：
+          ①详情页「补齐验证/疑似死任务/最近历史」HTML 表格颜色全部改用
+            Vuetify 主题变量（rgb(var(--v-theme-on-surface))、
+            rgb(var(--v-theme-surface))、rgba(var(--v-border-color),
+            var(--v-border-opacity)) 等），明暗主题自动适配，修复黑暗模式下
+            表格发白看不清
   v1.9.2  SA 转存改直连 API + 公开仓库脱敏：
           ①SA 提交新增「直连 API」最高优先级：登录拿 JWT（缓存 25 天，
             401 自动重登重试），POST /plugin/115/offline 一次提交全部链接
@@ -751,7 +762,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.3"
+    plugin_version = "1.9.4"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -1517,7 +1528,8 @@ class LackEpisodeAutoSub(_PluginBase):
         """
         API 端点：AY HTTP API 联调测试（v1.7.0）。
           save=0（默认）：只查 API，返回解析后的资源列表与额度，不提交 SA；
-          save=1：查 API + 经 SA 通道提交第一条链接并返回 SA 回执（端到端联调）；
+          save=1：查 API + 经 SA 通道提交第一条链接并返回 SA 回执（端到端联调；
+            v1.9.4 起走 __sa_submit 三级回退：直连 API → 企微 → TG）；
           eps（可选，v1.9.0）：模拟缺集，格式 `1:6-10;2:1-3`（S01E06-10 与
             S02E01-03），传入时选包逻辑用该缺集跑，返回 covered/uncovered
             明细与选包理由；不传时按 v1.7.0 策略选包，行为不变。
@@ -1593,15 +1605,13 @@ class LackEpisodeAutoSub(_PluginBase):
             if not picks:
                 data["sa_result"] = {"ok": False, "error": "无可提交的资源链接"}
             else:
-                mgr = self.__get_tg()
-                if not mgr:
-                    data["sa_result"] = {"ok": False, "error": "TG 管理器不可用"}
-                else:
-                    sub = mgr.submit(self._sa_bot,
-                                     [("API测试", str(picks[0].get("link") or ""))],
-                                     interval=self._aiying_interval)
-                    data["sa_result"] = sub
-                    logger.info(f"【{self.plugin_name}】联调测试 SA 提交结果: {sub}")
+                # v1.9.4：与主流程一致，走 __sa_submit 三级回退
+                # （直连 API → 企微 → TG），返回形状对齐 mgr.submit 并带 via 通道
+                sub = self.__sa_submit(
+                    [("API测试", str(picks[0].get("link") or ""))], "联调测试")
+                data["sa_result"] = sub
+                logger.info(f"【{self.plugin_name}】联调测试 SA 提交结果"
+                            f"（via={sub.get('via')}）: {sub}")
         return {"success": True, "message": "OK", "data": data}
 
     def api_sa_http_test(self, content: str = "") -> Dict[str, Any]:
@@ -3779,60 +3789,6 @@ class LackEpisodeAutoSub(_PluginBase):
                   f"选 {'+'.join(pick_labels) or '无'}，"
                   f"预计覆盖 {covered_n}/{len(lack_eps)}")
         return picks, reason
-
-    @staticmethod
-    def __ay_estimate_cover(resources: List[Dict[str, Any]],
-                            lack_eps: Set[Tuple[int, int]]
-                            ) -> Tuple[Optional[int], str]:
-        """
-        从资源 name/notes 尽力估算这批分享链接能覆盖多少缺集（v1.7.0，纯估算）。
-        支持模式：S01E05 单集、S1-S5/S01-S05 季范围、S01/第1季 整季、
-        全集/全xx集/Complete 整剧。
-        返回 (预计覆盖集数, 估算依据简述)；完全估不出返回 (None, "覆盖未知...")。
-        真实补齐以验证回环复查 Emby 入库为准（与现有设计一致）。
-        """
-        if not lack_eps:
-            return 0, ""
-        seasons_lack: Dict[int, Set[int]] = {}
-        for s, e in lack_eps:
-            seasons_lack.setdefault(s, set()).add(e)
-
-        covered: Set[Tuple[int, int]] = set()
-        evidence: List[str] = []
-        for r in resources:
-            text = f"{r.get('name') or ''} {r.get('notes') or ''}"
-            # 整剧：全集 / 全xx集 / Complete
-            if re.search(r"全集|全\s*\d+\s*集|complete", text, re.I):
-                covered |= set(lack_eps)
-                evidence.append("整剧")
-                continue
-            # 单集 S01E05
-            ep_hit = False
-            for m in re.finditer(r"S(\d{1,2})E(\d{1,3})", text, re.I):
-                key = (int(m.group(1)), int(m.group(2)))
-                if key in lack_eps:
-                    covered.add(key)
-                    ep_hit = True
-            if ep_hit:
-                evidence.append("单集")
-            # 季范围 S1-S5 / S01-S05（后面不带 E）
-            for m in re.finditer(r"S(\d{1,2})\s*[-~–]\s*S?(\d{1,2})(?!\d*E)", text, re.I):
-                s1, s2 = int(m.group(1)), int(m.group(2))
-                if s2 < s1:
-                    s1, s2 = s2, s1
-                for s in range(s1, s2 + 1):
-                    covered |= {(s, e) for e in seasons_lack.get(s, set())}
-                evidence.append(f"S{s1}-S{s2}")
-            # 单季 S01 / 第1季（后面不带集号、不是范围起点）
-            for m in re.finditer(
-                    r"S(\d{1,2})(?!\d*\s*[-~–E])|第\s*(\d{1,2})\s*季", text, re.I):
-                s = int(m.group(1) or m.group(2))
-                covered |= {(s, e) for e in seasons_lack.get(s, set())}
-                evidence.append(f"S{s:02d}")
-
-        if not covered:
-            return None, "覆盖未知，待入库验证"
-        return len(covered), "/".join(dict.fromkeys(evidence))
 
     def __save_api_quota(self, quota_left: Any):
         """持久化AY API 本月剩余次数（详情页统计卡展示用，与 TG 额度分开存）"""
