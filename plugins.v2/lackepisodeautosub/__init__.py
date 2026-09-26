@@ -22,6 +22,9 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.6  测试开关结果反馈增强：
+          ①AY 连通性测试、TG 发送验证码、TG 完成登录结果统一持久化；
+          ②详情页顶部展示最近一次操作结果横幅，三个操作均发送站内信通知
   v1.9.5  可观测性与 AY 鉴权诊断增强：
           ①失败计数细分为 TMDB、Emby、订阅、其他并在进度页展示；
           ②AY API 请求增加目标、状态码、耗时与脱敏 token 日志；
@@ -768,7 +771,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -902,6 +905,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_TG_LOGIN = "tg_login"          # TG 登录状态缓存 {logged_in, username, phone, ...}
     _DATA_AIYING = "aiying"              # AY通道状态 {quota_left: 本月剩余次数, updated: 时间}
     _DATA_DONELEDGER = "done_ledger"     # 完结账本（v1.6.0）：{tmdbid(str): {"title", "archived_at"}}
+    _DATA_LAST_OP = "last_op_result"      # 最近一次配置页测试操作结果（详情页顶部展示）
 
     # ==================================================================
     # 插件生命周期
@@ -937,6 +941,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 self.save_data(self._DATA_PENDING, {})
                 self.save_data(self._DATA_DEAD, [])
                 self.save_data(self._DATA_PROGRESS, {})
+                self.save_data(self._DATA_LAST_OP, {})
                 # v1.6.0：完结账本一并清空，下一轮自然回到全量扫描
                 self.save_data(self._DATA_DONELEDGER, {})
                 self._clear_history = False
@@ -954,21 +959,23 @@ class LackEpisodeAutoSub(_PluginBase):
             if self._ay_api_probe_once:
                 try:
                     probe = self.__ay_probe()
-                    probe_text = {
-                        "ok": "AY 连通性测试：✅ 通过",
-                        "401": ("AY 连通性测试：❌ 鉴权失败 401（可能 IP/token 未授权，"
-                                "需联系管理员加白名单）"),
-                        "disabled": "AY 连通性测试：未启用或配置不完整",
-                        "error": f"AY 连通性测试：异常（{probe.get('message') or '未知错误'}）",
-                    }.get(probe.get("result"), "AY 连通性测试：异常（未知结果）")
-                    logger.info(f"【{self.plugin_name}】{probe_text}")
-                    self.post_message(
-                        mtype=NotificationType.SiteMessage,
-                        title=f"【{self.plugin_name}】AY 连通性测试",
-                        text=probe_text,
+                    probe_result = probe.get("result") or "error"
+                    probe_message = {
+                        "ok": "连接与鉴权正常",
+                        "401": ("鉴权失败 401，可能是 IP 或 token 未授权，"
+                                "需联系 AY 管理员加白名单"),
+                        "disabled": "AY API 未启用或配置不完整",
+                        "error": f"请求异常：{probe.get('message') or '未知错误'}",
+                    }.get(probe_result, "请求异常：未知结果")
+                    self.__record_op_result(
+                        op_type="ay_probe", label="AY 连通性测试",
+                        ok=probe_result == "ok", status=probe_result,
+                        message=probe_message, elapsed=probe.get("elapsed"),
                     )
+                    logger.info(f"【{self.plugin_name}】AY 连通性测试："
+                                f"{'通过' if probe_result == 'ok' else '失败'} — {probe_message}")
                 except Exception as e:
-                    logger.error(f"【{self.plugin_name}】AY 连通性测试通知失败（不影响主流程）: {e}")
+                    logger.error(f"【{self.plugin_name}】AY 连通性测试结果处理失败（不影响主流程）: {e}")
                 finally:
                     self._ay_api_probe_once = False
                     self.__update_config()
@@ -1022,7 +1029,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 logger.info(f"【{self.plugin_name}】老配置 cron「{legacy_cron}」已迁移为："
                             f"{SCAN_FREQ_OPTIONS[freq]}"
                             + (f"（{hour} 点 {minute} 分）" if freq == "daily" else "")
-                            + (f"（自定义表达式保留原文）" if freq == "custom" else ""))
+                            + ("（自定义表达式保留原文）" if freq == "custom" else ""))
         # 由组合字段生成最终 cron 并校验合法性（非法则回退默认，防止注册失败）
         self._cron = self.__build_cron(
             self._scan_freq, self._scan_hour, self._scan_minute, self._cron_custom)
@@ -3448,6 +3455,42 @@ class LackEpisodeAutoSub(_PluginBase):
         except Exception as e:
             logger.debug(f"【{self.plugin_name}】保存 TG 登录状态失败: {e}")
 
+    def __record_op_result(self, op_type: str, label: str, ok: bool,
+                           message: str, status: str = "",
+                           elapsed: Optional[float] = None):
+        """持久化配置页测试结果，并同时发送外部通知与 MP 站内信。"""
+        result = {
+            "type": op_type,
+            "label": label,
+            "ok": bool(ok),
+            "status": status or "",
+            "message": message,
+            "time": datetime.datetime.now(
+                tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+        }
+        if elapsed is not None:
+            result["elapsed"] = elapsed
+        try:
+            self.save_data(self._DATA_LAST_OP, result)
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】保存{label}结果失败（不影响主流程）: {e}")
+
+        text = f"{label}：{'通过' if ok else '失败'} — {message}"
+        title = f"【{self.plugin_name}】{label}"
+        try:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text=text,
+            )
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】发送{label}外部通知失败（不影响主流程）: {e}")
+        try:
+            # _PluginBase.systemmessage 是 MessageHelper 实例，put() 写入网页铃铛消息队列。
+            self.systemmessage.put(message=text, title=title)
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】发送{label}站内信失败（不影响主流程）: {e}")
+
     def __handle_tg_login_actions(self):
         """
         处理配置页的两个一次性开关（保存配置即触发，结果写日志与详情页状态区）：
@@ -3456,44 +3499,88 @@ class LackEpisodeAutoSub(_PluginBase):
         处理完复位开关并回写配置（否则每次保存都会重复触发）。
         """
         mgr = self.__get_tg()
-        if not mgr:
-            logger.warning(f"【{self.plugin_name}】telethon 未安装，无法执行 TG 登录动作"
-                           f"（请确认插件目录 requirements.txt 依赖已安装）")
-            self._tg_send_code_once = False
-            self._tg_verify_once = False
-            self._tg_code = ""
-            self.__update_config()
-            return
-
         changed = False
+
         if self._tg_send_code_once:
-            if not self._tg_phone:
-                logger.warning(f"【{self.plugin_name}】请先填写 TG 手机号再发送验证码")
-            else:
-                res = mgr.send_code(self._tg_phone)
-                if res.get("ok"):
-                    logger.info(f"【{self.plugin_name}】TG 验证码已发送至 {self._tg_phone}，"
-                                f"请到 TG 内「Telegram」官方会话查看（不是短信），"
-                                f"然后填验证码并勾「完成登录」再保存一次")
+            ok = False
+            status = ""
+            message = ""
+            try:
+                if not mgr:
+                    status = "unavailable"
+                    message = "telethon 未安装或 TG 管理器不可用"
+                    logger.warning(f"【{self.plugin_name}】{message}，无法发送 TG 验证码")
+                elif not self._tg_phone:
+                    status = "missing_phone"
+                    message = "请先填写 TG 手机号再发送验证码"
+                    logger.warning(f"【{self.plugin_name}】{message}")
                 else:
-                    logger.error(f"【{self.plugin_name}】TG 发送验证码失败: {res.get('error')}")
-            self._tg_send_code_once = False
-            changed = True
+                    res = mgr.send_code(self._tg_phone) or {}
+                    ok = bool(res.get("ok"))
+                    if ok:
+                        phone = self._tg_phone
+                        masked_phone = (f"{phone[:3]}****{phone[-4:]}"
+                                        if len(phone) >= 7 else "****")
+                        message = f"验证码已发送至 {masked_phone}"
+                        logger.info(f"【{self.plugin_name}】{message}，"
+                                    f"请到 TG 内「Telegram」官方会话查看（不是短信），"
+                                    f"然后填验证码并勾「完成登录」再保存一次")
+                    else:
+                        message = str(res.get("error") or "未知错误")
+                        status = message
+                        logger.error(f"【{self.plugin_name}】TG 发送验证码失败: {message}")
+            except Exception as e:
+                status = "exception"
+                message = str(e) or "未知错误"
+                logger.error(f"【{self.plugin_name}】TG 发送验证码异常: {e}")
+            finally:
+                self.__record_op_result(
+                    op_type="tg_send_code", label="TG 发送验证码",
+                    ok=ok, status=status, message=message or "未知结果",
+                )
+                self._tg_send_code_once = False
+                changed = True
 
         if self._tg_verify_once:
-            if not self._tg_phone or not self._tg_code:
-                logger.warning(f"【{self.plugin_name}】请先填写手机号与验证码再完成登录")
-            else:
-                res = mgr.verify(self._tg_phone, self._tg_code, self._tg_password)
-                if res.get("ok"):
-                    self.__persist_tg_login(res)
-                    logger.info(f"【{self.plugin_name}】TG 登录成功: "
-                                f"{res.get('first_name')} (@{res.get('username')})")
+            ok = False
+            status = ""
+            message = ""
+            try:
+                if not mgr:
+                    status = "unavailable"
+                    message = "telethon 未安装或 TG 管理器不可用"
+                    logger.warning(f"【{self.plugin_name}】{message}，无法完成 TG 登录")
+                elif not self._tg_phone or not self._tg_code:
+                    status = "missing_credentials"
+                    message = "请先填写手机号与验证码再完成登录"
+                    logger.warning(f"【{self.plugin_name}】{message}")
                 else:
-                    logger.error(f"【{self.plugin_name}】TG 登录失败: {res.get('error')}")
-            self._tg_verify_once = False
-            self._tg_code = ""   # 验证码一次性使用，保存后清空
-            changed = True
+                    res = mgr.verify(self._tg_phone, self._tg_code, self._tg_password) or {}
+                    ok = bool(res.get("ok"))
+                    if ok:
+                        self.__persist_tg_login(res)
+                        first_name = str(res.get("first_name") or "").strip()
+                        username = str(res.get("username") or "").strip()
+                        account = (f"{first_name} (@{username})" if first_name and username
+                                   else first_name or (f"@{username}" if username else "当前账号"))
+                        message = f"登录成功: {account}"
+                        logger.info(f"【{self.plugin_name}】TG {message}")
+                    else:
+                        message = str(res.get("error") or "未知错误")
+                        status = message
+                        logger.error(f"【{self.plugin_name}】TG 登录失败: {message}")
+            except Exception as e:
+                status = "exception"
+                message = str(e) or "未知错误"
+                logger.error(f"【{self.plugin_name}】TG 登录异常: {e}")
+            finally:
+                self.__record_op_result(
+                    op_type="tg_verify", label="TG 完成登录",
+                    ok=ok, status=status, message=message or "未知结果",
+                )
+                self._tg_verify_once = False
+                self._tg_code = ""   # 验证码一次性使用，保存后清空
+                changed = True
 
         if changed:
             self.__update_config()
@@ -3685,14 +3772,13 @@ class LackEpisodeAutoSub(_PluginBase):
                     and self._aiying_api_url and self._aiying_api_token):
                 return {"result": "disabled", "status": None,
                         "message": "AY API 未启用或配置不完整", "elapsed": 0.0}
-            tg_id, _ = self.__resolve_tg_id()
             token = self._aiying_api_token or ""
             mask = token[:4] + "****" if len(token) > 4 else "****"
             target = urlparse(self._aiying_api_url).hostname or self._aiying_api_url
             logger.info(f"AY API 预检请求已发出 → 目标 {target}，tmdb_id=1")
             resp = requests.post(
                 self._aiying_api_url,
-                json={"tg_id": str(tg_id or "0"), "type": "tv",
+                json={"tg_id": str(self._tg_id or "0"), "type": "tv",
                       "tmdb_id": "1", "token": self._aiying_api_token},
                 timeout=10)
             elapsed = time.monotonic() - start
@@ -5340,6 +5426,7 @@ class LackEpisodeAutoSub(_PluginBase):
         pending = self.get_data(self._DATA_PENDING) or {}
         dead_snapshot = self.get_data(self._DATA_DEAD) or {}
         done_ledger = self.get_data(self._DATA_DONELEDGER) or {}  # 完结账本（v1.6.0）
+        op_result = self.get_data(self._DATA_LAST_OP) or {}
         recent = list(reversed(history[-50:]))  # 最新在前
         # v1.7.0：历史表加「渠道」列（emoji 着色：蓝 PT / 绿 115 / 橙 混合）
         # 与「渠道详情」列（长文本截断显示；MP 页面 schema 不支持单元格 title 悬浮，
@@ -5526,7 +5613,37 @@ class LackEpisodeAutoSub(_PluginBase):
                     }]
                 })
 
-        page = tg_rows + progress_rows + [
+        # ---- 最近一次配置页测试结果（v1.9.6）：固定展示在详情页最顶部 ----
+        op_result_rows: List[dict] = []
+        if op_result.get("time"):
+            _op_ok = bool(op_result.get("ok"))
+            _op_label = op_result.get("label") or "最近操作"
+            _op_message = op_result.get("message") or "无详细信息"
+            _op_elapsed_text = ""
+            if op_result.get("type") == "ay_probe" and op_result.get("elapsed") is not None:
+                try:
+                    _op_elapsed_text = f"，耗时 {float(op_result['elapsed']):.2f}s"
+                except (TypeError, ValueError):
+                    pass
+            op_result_rows.append({
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'success' if _op_ok else 'error',
+                            'variant': 'tonal', 'density': 'compact', 'closable': True,
+                            'text': (f"{_op_label}：{'通过' if _op_ok else '失败'} — "
+                                     f"{_op_message}（{op_result.get('time')}）"
+                                     f"{_op_elapsed_text}"),
+                        }
+                    }]
+                }]
+            })
+
+        page = op_result_rows + tg_rows + progress_rows + [
             # ---- 静态快照提示（v1.5.0）：页面不会自动刷新 ----
             {
                 'component': 'VRow',
