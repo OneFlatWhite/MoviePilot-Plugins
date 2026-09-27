@@ -22,6 +22,17 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.9  中转摘集（认领制，只碰自己账上的包）：
+          ①SA 离线落点固定在云下载（SA 不监控的天然中转站），新增待摘
+            台账 pending_pick：SA 提交成功即登记包名/缺集快照/提交时间；
+          ②验证回环前置摘集：按包名直查认领（云下载根目录 CD2 不让列，
+            不枚举）+ 时间窗校验，文件经 mtime+两轮大小稳定性校验后，缺的集移
+            到集合爱影交给 SA 归档，其余移到补集待清理；别人的离线缓
+            存一律不碰；
+          ③剧完结（包摘完且核销）或台账超 7 天，自动清空该剧待清理
+            目录并销账——只移不删兜底，完结才清空；
+          ④新增配置：中转摘集开关/中转目录/投喂目录/待清理目录/文件
+            稳定分钟数；新增 API GET /pick_prune 手动摘集
   v1.9.8  115 分享包转存前验包 + 无效包记忆：
           ①新增 __ay_verify_picks：对选中的 115 分享链接匿名调用
             webapi.115.com/share/snap 递归列出包内真实文件，解析实际
@@ -172,12 +183,14 @@ import os
 import random
 import re
 import struct
+import shutil
 import threading
 import time
 import traceback
 from threading import Event as ThreadEvent
 from typing import Any, Dict, List, Optional, Set, Tuple
 from html import escape as _escape_html
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytz
@@ -789,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.8"
+    plugin_version = "1.9.9"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -913,6 +926,13 @@ class LackEpisodeAutoSub(_PluginBase):
     _sa_api_password: str = ""           # SA 登录密码（同上）
     _sa_api_parent_id: str = ""          # 115 离线目标目录 cid（留空=自动取 folders 第一项）
 
+    # 【中转摘集】（v1.9.9 新增；老配置缺字段默认值兜底，向后兼容）
+    _pick_prune_enabled: bool = True     # 中转摘集开关
+    _pick_staging_dir: str = "/CloudNAS/CloudDrive/115open/云下载"   # 离线落点（SA 不监控，天然中转站）
+    _pick_feed_dir: str = "/CloudNAS/CloudDrive/115open/集合爱影"    # 摘出的缺集投喂给 SA 的目录
+    _pick_trash_dir: str = "/CloudNAS/CloudDrive/115open/补集待清理"  # 非缺集暂存（剧完结/到期后清空）
+    _pick_stable_min: int = 10           # 文件稳定分钟数：小于该值视为可能在写入，不动
+
     # 持久化数据的 key
     _DATA_PROCESSED = "processed"        # 已处理（已成功订阅）的剧 {tmdbid: {...}}
     _DATA_HISTORY = "history"            # 运行历史列表（最多保留 200 条）
@@ -927,6 +947,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_LAST_OP = "last_op_result"      # 最近一次配置页测试操作结果（详情页顶部展示）
     _DATA_BADPACK = "aiying_badpack"     # 无效包记忆（v1.9.8）：{tmdbid: {share_code: {ts, miss, brief}}}
     _BADPACK_TTL = 7 * 86400             # 无效包记忆有效期（秒）：给资源方补档留 7 天
+    _DATA_PENDING_PICK = "pending_pick"  # 待摘台账（v1.9.9）：{tmdbid: {title, ts, lack, lack_remaining, packs, via, dir_snap}}
 
     # ==================================================================
     # 插件生命周期
@@ -966,6 +987,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 # v1.6.0：完结账本一并清空，下一轮自然回到全量扫描
                 self.save_data(self._DATA_DONELEDGER, {})
                 self.save_data(self._DATA_BADPACK, {})
+                self.save_data(self._DATA_PENDING_PICK, {})
                 self._clear_history = False
                 logger.info(f"【{self.plugin_name}】历史记录、已处理清单与完结账本已清空")
                 self.__update_config()
@@ -1155,6 +1177,15 @@ class LackEpisodeAutoSub(_PluginBase):
         self._sa_api_user = str(config.get("sa_api_user") or "").strip()
         self._sa_api_password = str(config.get("sa_api_password") or "")
         self._sa_api_parent_id = str(config.get("sa_api_parent_id") or "").strip()
+        # 中转摘集（v1.9.9 新增；老配置缺字段默认值兜底，向后兼容）
+        self._pick_prune_enabled = bool(config.get("pick_prune_enabled", True))
+        self._pick_staging_dir = str(
+            config.get("pick_staging_dir") or "/CloudNAS/CloudDrive/115open/云下载").strip()
+        self._pick_feed_dir = str(
+            config.get("pick_feed_dir") or "/CloudNAS/CloudDrive/115open/集合爱影").strip()
+        self._pick_trash_dir = str(
+            config.get("pick_trash_dir") or "/CloudNAS/CloudDrive/115open/补集待清理").strip()
+        self._pick_stable_min = max(1, self.__to_int(config.get("pick_stable_min"), 10))
 
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
@@ -1274,6 +1305,11 @@ class LackEpisodeAutoSub(_PluginBase):
             "sa_api_user": self._sa_api_user,
             "sa_api_password": self._sa_api_password,
             "sa_api_parent_id": self._sa_api_parent_id,
+            "pick_prune_enabled": self._pick_prune_enabled,
+            "pick_staging_dir": self._pick_staging_dir,
+            "pick_feed_dir": self._pick_feed_dir,
+            "pick_trash_dir": self._pick_trash_dir,
+            "pick_stable_min": self._pick_stable_min,
         })
 
     def get_state(self) -> bool:
@@ -1355,6 +1391,14 @@ class LackEpisodeAutoSub(_PluginBase):
                 "auth": "apikey",
                 "summary": "查询插件当前状态",
                 "description": "返回统计信息：待验证数/已核销数/超时未补齐数/今日已订阅数/今日配额等",
+            },
+            {
+                "path": "/pick_prune",
+                "endpoint": self.api_pick_prune,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "手动执行一次中转摘集",
+                "description": "认领制：缺的集移到集合爱影交给 SA，其余移待清理；返回摘要与台账",
             },
             {
                 "path": "/tg_send_code",
@@ -2556,6 +2600,264 @@ class LackEpisodeAutoSub(_PluginBase):
         logger.info(f"【{cand['title']}】已登记入库验证快照，"
                     f"缺集 {cand['missing']} 集，之后每轮复查")
 
+    # ==================================================================
+    # 中转摘集（v1.9.9 新增）：SA 离线落云下载（SA 不监控），插件按缺集摘给 SA
+    # ==================================================================
+    def __pick_ledger(self) -> Dict[str, Any]:
+        """读待摘台账；异常/损坏一律按空处理。"""
+        try:
+            data = self.get_data(self._DATA_PENDING_PICK) or {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def __pick_ledger_save(self, data: Dict[str, Any]) -> None:
+        try:
+            self.save_data(self._DATA_PENDING_PICK, data)
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】待摘台账保存失败: {e}")
+
+    def __pick_ledger_add(self, tmdbid: int, title: str,
+                          lack_eps: Set[Tuple[int, int]],
+                          ok_picks: List[Dict[str, Any]], via: str) -> None:
+        """
+        提交成功即记待摘台账（v1.9.9，认领制的前提）：
+        包名优先取验包快照里的 share_title（与 115 落地目录名一致），
+        缺集快照/提交时间一并落账；同剧重复提交只补新链接。
+        """
+        data = self.__pick_ledger()
+        task = data.get(str(tmdbid)) or {}
+        packs = task.get("packs") or []
+        known = {p.get("link") for p in packs}
+        for r in ok_picks:
+            link = str(r.get("link") or "")
+            if not link or link in known:
+                continue
+            code, _pwd = self.__ay_parse_share(link)
+            packs.append({
+                "link": link,
+                "share_code": code or "",
+                "share_title": str(r.get("_share_title") or r.get("name") or ""),
+                "done": False,
+            })
+        if not packs:
+            return
+        task.setdefault("ts", int(time.time()))
+        task.update({
+            "title": title,
+            "lack": sorted(f"S{s:02d}E{e:02d}" for s, e in lack_eps),
+            "lack_remaining": sorted(f"S{s:02d}E{e:02d}" for s, e in lack_eps),
+            "packs": packs,
+            "via": via,
+            "dir_snap": task.get("dir_snap") or {},
+        })
+        data[str(tmdbid)] = task
+        self.__pick_ledger_save(data)
+        logger.info(f"【{title}】已记待摘台账：缺 {len(lack_eps)} 集、"
+                    f"包 {len(packs)} 个（中转摘集）")
+
+    @staticmethod
+    def __pick_lack_set(task: Dict[str, Any]) -> Set[Tuple[int, int]]:
+        """把台账里的 SxxExx 字符串还原成 (季, 集) 集合。"""
+        out: Set[Tuple[int, int]] = set()
+        for it in task.get("lack_remaining") or task.get("lack") or []:
+            m = re.fullmatch(r"S(\d{1,2})E(\d{1,3})", str(it), re.I)
+            if m:
+                out.add((int(m.group(1)), int(m.group(2))))
+        return out
+
+    def __pick_resolve_title(self, pack: Dict[str, Any]) -> str:
+        """
+        取包的落地目录名（v1.9.9.1）：优先台账里验包时存的 share_title；
+        缺失时当场匿名调快照接口按链接补取。云下载根目录是 115 系统目录，
+        CD2 挂载不允许列出（ls 报 EIO），只能按名直查不能枚举。
+        """
+        title = (pack.get("share_title") or "").strip()
+        if title:
+            return title
+        code, pwd = self.__ay_parse_share(str(pack.get("link") or ""))
+        if not code:
+            return ""
+        snap, _err = self.__ay_share_files(code, pwd)
+        if snap and snap.get("title"):
+            pack["share_title"] = str(snap["title"])
+            return str(snap["title"]).strip()
+        return ""
+
+    def __pick_find_dir(self, staging: Path, pack: Dict[str, Any],
+                        task: Dict[str, Any], tmdbid: int) -> Optional[Path]:
+        """
+        认领（v1.9.9.1 修订）：不枚举中转根目录（CD2 对 115 系统目录报 EIO），
+        改为按包名直查 staging/<share_title>；且目录修改时间不早于提交时间
+        （5 分钟容差）。查不到即非本插件的包/包还没到，绝不乱认别人的缓存。
+        """
+        want = self.__pick_resolve_title(pack)
+        if not want:
+            return None
+        earliest = int(task.get("ts") or 0) - 300
+        entry = staging / want
+        try:
+            if not entry.is_dir():
+                return None
+            if entry.stat().st_mtime < earliest:
+                return None
+            return entry
+        except Exception:
+            return None
+
+    def __pick_move(self, src: Path, dst: Path) -> None:
+        """同盘改名移动（115 服务器端操作，不走带宽）；跨盘兜底 shutil.move。"""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            src.unlink()          # 目标已存在：源按重复处理删除
+            return
+        try:
+            os.rename(str(src), str(dst))
+        except OSError:
+            shutil.move(str(src), str(dst))
+
+    def __pick_process(self, tmdbid: int, task: Dict[str, Any],
+                       pack: Dict[str, Any], pack_dir: Path,
+                       summary: Dict[str, Any]) -> None:
+        """
+        处理一个已认领的包目录：文件须稳定（mtime 超过 _pick_stable_min 分钟，
+        且两轮快照间大小不变）才移动；缺的集移投喂目录，其余移待清理；
+        全部移完标记 done 并清掉空壳目录（空目录首次出现不判完成，
+        防止离线还没传完被误判）。
+        """
+        title = task.get("title") or str(tmdbid)
+        lack = self.__pick_lack_set(task)
+        feed_root = Path(self._pick_feed_dir)
+        trash_root = Path(self._pick_trash_dir) / title
+        now = time.time()
+        dir_snap = task.setdefault("dir_snap", {})
+        old_snap = dir_snap.get(str(pack_dir)) or {}
+        new_snap: Dict[str, Any] = {}
+        files_left = 0
+        stable_sec = max(1, self._pick_stable_min) * 60
+        for fp in sorted(pack_dir.rglob("*")):
+            if not fp.is_file():
+                continue
+            try:
+                st = fp.stat()
+            except Exception:
+                continue
+            key = str(fp)
+            new_snap[key] = [st.st_size, int(st.st_mtime)]
+            if now - st.st_mtime < stable_sec:
+                files_left += 1        # 太新：可能还在写入，下轮再动
+                continue
+            old = old_snap.get(key)
+            if old is not None and old[0] != st.st_size:
+                files_left += 1        # 两轮间大小变了：还在写，下轮
+                continue
+            eps = self.__ay_eps_from_names([fp.name])
+            hit = eps & lack
+            rel = fp.relative_to(pack_dir)
+            dst = (feed_root / pack_dir.name / rel) if hit else (trash_root / rel)
+            try:
+                self.__pick_move(fp, dst)
+                if hit:
+                    summary["moved_feed"] += 1
+                    lack -= hit
+                    logger.info(f"【{title}】摘出缺集 {fp.name} → 投喂 SA")
+                else:
+                    summary["moved_trash"] += 1
+            except Exception as e:
+                files_left += 1
+                logger.error(f"【{title}】移动 {fp.name} 失败: {e}")
+        task["lack_remaining"] = sorted(f"S{s:02d}E{e:02d}" for s, e in lack)
+        dir_snap[str(pack_dir)] = new_snap
+        if files_left == 0 and (new_snap or old_snap):
+            pack["done"] = True
+            summary["packs_done"] += 1
+            try:
+                shutil.rmtree(pack_dir, ignore_errors=True)
+            except Exception:
+                pass
+            logger.info(f"【{title}】包「{pack_dir.name}」摘集完成")
+
+    def __pick_task_closed(self, tid: str, task: Dict[str, Any],
+                           pending_verify: Dict[str, Any], now: float) -> bool:
+        """
+        剧完结（包全部摘完且已不在 pending_verify）或台账超 7 天：
+        清空该剧待清理目录并销账（约定：只移不删兜底，修复好了才清空）。
+        """
+        packs = task.get("packs") or []
+        all_done = bool(packs) and all(p.get("done") for p in packs)
+        aged = now - int(task.get("ts") or now) > self._BADPACK_TTL
+        if not (aged or (all_done and tid not in pending_verify)):
+            return False
+        title = task.get("title") or tid
+        trash_show = Path(self._pick_trash_dir) / title
+        if trash_show.exists():
+            try:
+                shutil.rmtree(trash_show, ignore_errors=True)
+                logger.info(f"【{title}】已完结/到期，已清空待清理目录")
+            except Exception as e:
+                logger.error(f"【{title}】清空待清理目录失败: {e}")
+        return True
+
+    def __pick_prune_staging(self) -> Dict[str, Any]:
+        """
+        中转摘集主流程（v1.9.9）。认领制按包名直查，只碰自己账上的包；
+        别人的离线缓存一律跳过。返回处理摘要（日志与 API 展示用）。
+        """
+        summary = {"moved_feed": 0, "moved_trash": 0, "packs_done": 0,
+                   "shows_closed": 0}
+        if not self._pick_prune_enabled:
+            return summary
+        data = self.__pick_ledger()
+        if not data:
+            return summary
+        staging = Path(self._pick_staging_dir)
+        if not staging.exists():
+            logger.warning(f"【{self.plugin_name}】中转目录不存在：{staging}")
+            return summary
+        pending_verify = self.get_data(self._DATA_PENDING) or {}
+        now = time.time()
+        changed = False
+        for tid, task in list(data.items()):
+            title = task.get("title") or tid
+            try:
+                if self.__pick_task_closed(tid, task, pending_verify, now):
+                    summary["shows_closed"] += 1
+                    data.pop(tid, None)
+                    changed = True
+                    continue
+                try:
+                    tmdbid = int(tid)
+                except Exception:
+                    tmdbid = 0
+                for pack in task.get("packs") or []:
+                    if pack.get("done"):
+                        continue
+                    pack_dir = self.__pick_find_dir(staging, pack, task, tmdbid)
+                    if not pack_dir:
+                        continue        # 包还没到，下轮再看
+                    self.__pick_process(tmdbid, task, pack, pack_dir, summary)
+                    changed = True
+            except Exception as e:
+                logger.error(f"【{title}】中转摘集处理异常（跳过该剧）: {e}")
+        if changed:
+            self.__pick_ledger_save(data)
+        return summary
+
+    def api_pick_prune(self) -> Dict[str, Any]:
+        """API 端点：手动执行一次中转摘集（v1.9.9）。"""
+        try:
+            summary = self.__pick_prune_staging()
+            ledger = self.__pick_ledger()
+            return {"success": True, "message": "OK",
+                    "data": {"summary": summary,
+                             "pending_pick": {
+                                 k: {"title": v.get("title"),
+                                     "lack_remaining": v.get("lack_remaining"),
+                                     "packs": len(v.get("packs") or [])}
+                                 for k, v in ledger.items()}}}
+        except Exception as e:
+            return {"success": False, "message": str(e), "data": {}}
+
     def __verify_pending(self, history: List[Dict[str, Any]],
                          stats: Dict[str, Any]):
         """
@@ -2566,6 +2868,14 @@ class LackEpisodeAutoSub(_PluginBase):
             并按配置执行超时闭环动作（自动重置订阅 / 订阅丢失补订，v1.5.0）
         单部复查失败跳过该部，不中断整轮复查。
         """
+        # v1.9.9：先执行中转摘集（把云下载里本插件的包按缺集摘给 SA），再复查入库
+        try:
+            _pick_summary = self.__pick_prune_staging()
+            if any(_pick_summary.get(k) for k in
+                   ("moved_feed", "moved_trash", "packs_done", "shows_closed")):
+                logger.info(f"【{self.plugin_name}】中转摘集：{_pick_summary}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】中转摘集异常（不影响入库复查）: {e}")
         pending: Dict[str, Any] = self.get_data(self._DATA_PENDING) or {}
         if not pending:
             logger.debug(f"【{self.plugin_name}】无待验证的订阅，跳过入库复查")
@@ -3995,6 +4305,7 @@ class LackEpisodeAutoSub(_PluginBase):
         返回 (文件名列表, 错误信息)；失败时文件名列表为 None。
         """
         names: List[str] = []
+        meta = {"title": ""}
         base = "https://webapi.115.com/share/snap"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -4015,6 +4326,10 @@ class LackEpisodeAutoSub(_PluginBase):
                     raise RuntimeError(
                         payload.get("error")
                         or f"快照接口返回失败（errno={payload.get('errno')}）")
+                if not cid and not meta["title"]:
+                    meta["title"] = str(((payload.get("data") or {})
+                                         .get("shareinfo") or {})
+                                        .get("share_title") or "")
                 items = ((payload.get("data") or {}).get("list")) or []
                 if not items:
                     break
@@ -4031,7 +4346,7 @@ class LackEpisodeAutoSub(_PluginBase):
 
         try:
             _walk("", 1)
-            return names, ""
+            return {"names": names, "title": meta["title"]}, ""
         except Exception as e:
             return None, str(e)
 
@@ -4103,13 +4418,13 @@ class LackEpisodeAutoSub(_PluginBase):
                 notes.append(f"跳过无效包（{bad[code].get('miss') or '此前验包无所需集'}）")
                 logger.info(f"【{title}】分享码 {code} 在无效包记忆内，跳过")
                 continue
-            names, err = self.__ay_share_files(code, pwd)
-            if names is None:
+            snap, err = self.__ay_share_files(code, pwd)
+            if snap is None:
                 logger.warning(f"【{title}】分享码 {code} 快照验包失败（{err}），"
                                f"保守放行沿用文本估算")
                 kept.append(r)
                 continue
-            actual = self.__ay_eps_from_names(names)
+            actual = self.__ay_eps_from_names(snap["names"])
             hit = actual & lack_eps
             brief = self.__ay_eps_brief(actual)
             if not hit:
@@ -4121,6 +4436,8 @@ class LackEpisodeAutoSub(_PluginBase):
                                f"无所缺 {miss_brief}（分享码 {code} 拉黑 7 天）")
                 continue
             r["_actual_cover"] = actual
+            r["_share_code"] = code
+            r["_share_title"] = snap.get("title") or ""
             notes.append(f"验包通过（包内 {brief}，命中缺集 "
                          f"{self.__ay_eps_brief(hit)}）")
             kept.append(r)
@@ -4342,6 +4659,13 @@ class LackEpisodeAutoSub(_PluginBase):
         cover_text = f"预计覆盖 {cover}/{len(lack_eps)} 集"
         logger.info(f"【{title}】AY API 提交结果：{len(ok_picks)}/{len(items)} 条成功，"
                     f"{cover_text}")
+
+        # ---- 4.5 记待摘台账（v1.9.9：提交成功即入账，供中转摘集认领） ----
+        if ok_picks and self._pick_prune_enabled:
+            try:
+                self.__pick_ledger_add(tmdbid, title, lack_eps, ok_picks, sa_via)
+            except Exception as e:
+                logger.error(f"【{title}】待摘台账登记失败（不影响主流程）: {e}")
 
         # ---- 5. 人话明细（渠道详情记录，写历史与汇总通知用） ----
         ok_n = len(ok_picks)
@@ -5310,6 +5634,56 @@ class LackEpisodeAutoSub(_PluginBase):
                                           'persistent-hint': False}
                             }]
                         }]
+                    },
+                    # ---- 第十一行又半1：中转摘集（v1.9.9） ----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'pick_prune_enabled',
+                                              'label': '中转摘集',
+                                              'hint': '离线落中转目录，插件按缺集摘给 SA，其余移待清理',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'pick_staging_dir',
+                                              'label': '中转目录（SA 不监控）',
+                                              'placeholder': '/CloudNAS/CloudDrive/115open/云下载',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'pick_feed_dir',
+                                              'label': '投喂目录（SA 监控）',
+                                              'placeholder': '/CloudNAS/CloudDrive/115open/集合爱影',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'pick_trash_dir',
+                                              'label': '待清理目录（完结自动清空）',
+                                              'placeholder': '/CloudNAS/CloudDrive/115open/补集待清理',
+                                              'persistent-hint': False}
+                                }]
+                            },
+                        ]
                     },
                     # ---- 第十一行又半2：SA 直连 API（v1.9.2，最高优先级） ----
                     {
