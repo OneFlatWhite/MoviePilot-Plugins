@@ -22,6 +22,24 @@ MoviePilot V2 自定义插件：缺集自动补齐（LackEpisodeAutoSub）
                                   （recognize_media 一次调用即带回，无需为优先级额外请求 TMDB 详情）
 
 版本历史：
+  v1.9.8  115 分享包转存前验包 + 无效包记忆：
+          ①新增 __ay_verify_picks：对选中的 115 分享链接匿名调用
+            webapi.115.com/share/snap 递归列出包内真实文件，解析实际
+            集数覆盖——包名无集数标识时不再盲信「全剧覆盖」，包内没
+            有所缺集数的包直接淘汰，不再白拉整包（此前会对缺 1 集
+            的剧白拉 255G 整季包，需要的 E41 却不在包内）；
+          ②验包不通过的分享码按剧记入无效包记忆（_DATA_BADPACK，
+            7 天有效期给资源方补档留余地），后续扫描自动跳过；
+          ③非 115 链接/快照失败时保守放行，沿用文本估算不打断流程；
+          ④验包成功的包以真实覆盖参与预计覆盖计算，明细记录
+            「包内实有 S1:E01-E40，缺 E41」式人话
+  v1.9.7  AY API 网络路径与探测准确性优化：
+          ①AY API 请求（预检+查询）改用独立 Session（trust_env=False）
+            强制直连，不再读容器 HTTP(S)_PROXY 环境代理——AY 按调用方
+            IP 做白名单，走代理节点出口会被拒（401），直连保证 AY 看到
+            的是已加白的家宽 IP；容器其余流量（TMDB/TG 等）不受影响；
+          ②AY 连通性预检 tg_id 改走 __resolve_tg_id（配置→TG 会话），
+            拿不到时明确报「tg_id 未获取」，不再发 tg_id=0 吃误导性 401
   v1.9.6  测试开关结果反馈增强：
           ①AY 连通性测试、TG 发送验证码、TG 完成登录结果统一持久化；
           ②详情页顶部展示最近一次操作结果横幅，三个操作均发送站内信通知
@@ -771,7 +789,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.6"
+    plugin_version = "1.9.8"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -875,6 +893,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _aiying_api_max_links: int = 3       # 单剧最多提交分享链接数
     _tg_id: str = ""                     # TG 用户 ID（API 需要；留空则从 TG 会话自动获取并缓存）
     _ay_api_probe_once: bool = False     # 一次性开关：保存配置时测试 AY API 连通性
+    _ay_http_session = None              # AY API 专用直连 Session（v1.9.7，惰性创建）
 
     # 【SA HTTP 直连转存】（v1.8.0 新增；v1.9.2 起降级为直连 API 的兜底；
     # 默认值已脱敏，请自行填写——用户在 MP 数据库的已存配置不受影响；
@@ -906,6 +925,8 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_AIYING = "aiying"              # AY通道状态 {quota_left: 本月剩余次数, updated: 时间}
     _DATA_DONELEDGER = "done_ledger"     # 完结账本（v1.6.0）：{tmdbid(str): {"title", "archived_at"}}
     _DATA_LAST_OP = "last_op_result"      # 最近一次配置页测试操作结果（详情页顶部展示）
+    _DATA_BADPACK = "aiying_badpack"     # 无效包记忆（v1.9.8）：{tmdbid: {share_code: {ts, miss, brief}}}
+    _BADPACK_TTL = 7 * 86400             # 无效包记忆有效期（秒）：给资源方补档留 7 天
 
     # ==================================================================
     # 插件生命周期
@@ -944,6 +965,7 @@ class LackEpisodeAutoSub(_PluginBase):
                 self.save_data(self._DATA_LAST_OP, {})
                 # v1.6.0：完结账本一并清空，下一轮自然回到全量扫描
                 self.save_data(self._DATA_DONELEDGER, {})
+                self.save_data(self._DATA_BADPACK, {})
                 self._clear_history = False
                 logger.info(f"【{self.plugin_name}】历史记录、已处理清单与完结账本已清空")
                 self.__update_config()
@@ -965,6 +987,8 @@ class LackEpisodeAutoSub(_PluginBase):
                         "401": ("鉴权失败 401，可能是 IP 或 token 未授权，"
                                 "需联系 AY 管理员加白名单"),
                         "disabled": "AY API 未启用或配置不完整",
+                        "no_tgid": ("tg_id 未获取到：请在配置中填写 tg_id，"
+                                    "或先完成 TG 登录后再测"),
                         "error": f"请求异常：{probe.get('message') or '未知错误'}",
                     }.get(probe_result, "请求异常：未知结果")
                     self.__record_op_result(
@@ -1603,6 +1627,11 @@ class LackEpisodeAutoSub(_PluginBase):
         else:
             picks, pick_reason = self.__ay_pick_links(
                 resources, self._aiying_api_max_links)
+        # v1.9.8：模拟缺集时同步跑验包（快照核实包内真实集数）
+        verify_reason = ""
+        if mock_lack and picks:
+            picks, verify_reason = self.__ay_verify_picks(
+                int(tmdbid), picks, mock_lack, f"联调-{tmdbid}")
         data: Dict[str, Any] = {
             "http_status": res.get("http_status"),
             "api_message": res.get("message", ""),
@@ -1630,6 +1659,7 @@ class LackEpisodeAutoSub(_PluginBase):
             data["eps_test"] = {
                 "lack": sorted(f"S{s:02d}E{e:02d}" for s, e in mock_lack),
                 "pick_reason": pick_reason,
+                "verify_reason": verify_reason,
                 "covered": sorted(f"S{s:02d}E{e:02d}" for s, e in covered),
                 "uncovered": sorted(f"S{s:02d}E{e:02d}"
                                     for s, e in (mock_lack - covered)),
@@ -3764,6 +3794,19 @@ class LackEpisodeAutoSub(_PluginBase):
         logger.warning(f"【{self.plugin_name}】获取 tg_id 失败: {res.get('error')}")
         return None, ""
 
+    def __ay_http(self) -> requests.Session:
+        """
+        AY API 专用 Session（v1.9.7）：trust_env=False 强制直连，
+        忽略容器 HTTP(S)_PROXY/ALL_PROXY 环境变量。AY 按调用方 IP 做
+        白名单，走代理节点出口 IP 会被拒（401）；直连保证 AY 看到的是
+        已加白的家宽 IP。容器其余流量（TMDB/TG 等）仍走全局代理。
+        """
+        if not self._ay_http_session:
+            session = requests.Session()
+            session.trust_env = False
+            self._ay_http_session = session
+        return self._ay_http_session
+
     def __ay_probe(self) -> Dict[str, Any]:
         """探测 AY API 连通性与鉴权状态；任何异常都转换为结果字典。"""
         start = time.monotonic()
@@ -3772,13 +3815,21 @@ class LackEpisodeAutoSub(_PluginBase):
                     and self._aiying_api_url and self._aiying_api_token):
                 return {"result": "disabled", "status": None,
                         "message": "AY API 未启用或配置不完整", "elapsed": 0.0}
+            # v1.9.7：tg_id 走 __resolve_tg_id（配置→TG 会话）；拿不到就
+            # 明确报「tg_id 未获取」，不再发 tg_id=0 吃一个误导性的 401
+            tg_id, tg_src = self.__resolve_tg_id()
+            if not tg_id:
+                return {"result": "no_tgid", "status": None,
+                        "message": "tg_id 未获取到（配置未填且 TG 会话不可用）",
+                        "elapsed": 0.0}
             token = self._aiying_api_token or ""
             mask = token[:4] + "****" if len(token) > 4 else "****"
             target = urlparse(self._aiying_api_url).hostname or self._aiying_api_url
-            logger.info(f"AY API 预检请求已发出 → 目标 {target}，tmdb_id=1")
-            resp = requests.post(
+            logger.info(f"AY API 预检请求已发出 → 目标 {target}，tmdb_id=1，"
+                        f"tg_id 来源={tg_src or '未知'}，强制直连")
+            resp = self.__ay_http().post(
                 self._aiying_api_url,
-                json={"tg_id": str(self._tg_id or "0"), "type": "tv",
+                json={"tg_id": str(tg_id), "type": "tv",
                       "tmdb_id": "1", "token": self._aiying_api_token},
                 timeout=10)
             elapsed = time.monotonic() - start
@@ -3802,7 +3853,8 @@ class LackEpisodeAutoSub(_PluginBase):
         """
         调AY HTTP API 查询某部剧的资源（v1.7.0，协议已实测）。
         POST {tg_id, type: "tv", tmdb_id, token}，超时 15 秒；
-        走 MP 全局代理（requests 默认读环境变量代理，与插件现有 HTTP 调用一致）。
+        v1.9.7 起强制直连（__ay_http，trust_env=False），不走容器环境代理——
+        AY 按 IP 白名单鉴权，必须保证出口为已加白的家宽 IP。
         返回 {ok, resources, quota_left, http_status, message}；
         网络/超时/HTTP 错/JSON 解析错一律抛异常，由调用方决定回退 TG 流程。
         """
@@ -3811,8 +3863,8 @@ class LackEpisodeAutoSub(_PluginBase):
             raise ValueError("AY API 地址未配置")
         start = time.monotonic()
         target = urlparse(self._aiying_api_url).hostname or self._aiying_api_url
-        logger.info(f"AY API 请求已发出 → 目标 {target}，tmdb_id={tmdbid}")
-        resp = requests.post(
+        logger.info(f"AY API 请求已发出 → 目标 {target}，tmdb_id={tmdbid}，强制直连")
+        resp = self.__ay_http().post(
             self._aiying_api_url,
             json={"tg_id": str(tg_id), "type": "tv",
                   "tmdb_id": str(tmdbid), "token": self._aiying_api_token},
@@ -3897,6 +3949,182 @@ class LackEpisodeAutoSub(_PluginBase):
         if not covered:
             covered = _whole()
         return covered
+
+    @staticmethod
+    def __ay_parse_share(link: str) -> Tuple[Optional[str], str]:
+        """从 115 分享链接解析 (share_code, 提取码)；非 115 分享链接返回 (None, "")。"""
+        m = re.search(r"https?://(?:115\.com|115cdn\.com|115cdn\.net)"
+                      r"/s/([A-Za-z0-9]+)", link or "")
+        if not m:
+            return None, ""
+        pm = re.search(r"[?&]password=([A-Za-z0-9]+)", link)
+        return m.group(1), (pm.group(1) if pm else "")
+
+    @staticmethod
+    def __ay_eps_from_names(names: List[str]) -> Set[Tuple[int, int]]:
+        """从文件名列表解析 (季, 集) 集合（识别 SxxExx 标识，v1.9.8）。"""
+        eps: Set[Tuple[int, int]] = set()
+        for n in names or []:
+            for m in re.finditer(r"S(\d{1,2})E(\d{1,3})", n or "", re.I):
+                eps.add((int(m.group(1)), int(m.group(2))))
+        return eps
+
+    @staticmethod
+    def __ay_eps_brief(eps: Set[Tuple[int, int]]) -> str:
+        """把 (季, 集) 集合压缩成人话摘要，如 S1:E01-E40(40集)（v1.9.8）。"""
+        if not eps:
+            return "空"
+        by_s: Dict[int, List[int]] = {}
+        for s, e in eps:
+            by_s.setdefault(s, []).append(e)
+        parts = []
+        for s in sorted(by_s)[:3]:
+            el = sorted(set(by_s[s]))
+            parts.append(f"S{s}:E{el[0]:02d}-E{el[-1]:02d}({len(el)}集)"
+                         if len(el) > 1 else f"S{s}:E{el[0]:02d}")
+        if len(by_s) > 3:
+            parts.append("…")
+        return " ".join(parts)
+
+    def __ay_share_files(self, share_code: str,
+                         receive_code: str) -> Tuple[Optional[List[str]], str]:
+        """
+        匿名调 115 分享快照接口（webapi.115.com/share/snap，仅需分享码+提取码，
+        实测免登录可用）递归列出分享内全部文件名（v1.9.8）。走 __ay_http 强制
+        直连（115 对境外 IP 不友好，经代理出口易失败）。
+        返回 (文件名列表, 错误信息)；失败时文件名列表为 None。
+        """
+        names: List[str] = []
+        base = "https://webapi.115.com/share/snap"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+        def _walk(cid: str, depth: int) -> None:
+            if depth > 3 or len(names) >= 3000:
+                return
+            offset = 0
+            while True:
+                params = {"share_code": share_code,
+                          "receive_code": receive_code,
+                          "limit": 1000, "offset": offset}
+                if cid:
+                    params["cid"] = cid
+                resp = self.__ay_http().get(base, params=params,
+                                            headers=headers, timeout=10)
+                payload = resp.json()
+                if not payload.get("state"):
+                    raise RuntimeError(
+                        payload.get("error")
+                        or f"快照接口返回失败（errno={payload.get('errno')}）")
+                items = ((payload.get("data") or {}).get("list")) or []
+                if not items:
+                    break
+                for it in items:
+                    if it.get("fid"):
+                        n = str(it.get("n") or "")
+                        if n:
+                            names.append(n)
+                    elif it.get("cid") is not None:
+                        _walk(str(it.get("cid")), depth + 1)
+                if len(items) < 1000:
+                    break
+                offset += 1000
+
+        try:
+            _walk("", 1)
+            return names, ""
+        except Exception as e:
+            return None, str(e)
+
+    def __ay_badpack_get(self, tmdbid: int) -> Dict[str, Any]:
+        """读某剧仍在有效期（7 天）内的无效包记录 {share_code: info}（v1.9.8）。"""
+        try:
+            data = self.get_data(self._DATA_BADPACK) or {}
+        except Exception:
+            return {}
+        packs = (data.get("packs") or {}).get(str(tmdbid)) or {}
+        now = int(time.time())
+        return {c: v for c, v in packs.items()
+                if now - int((v or {}).get("ts", 0)) < self._BADPACK_TTL}
+
+    def __ay_badpack_add(self, tmdbid: int, share_code: str,
+                         miss_brief: str, pack_brief: str) -> None:
+        """把分享码记入某剧的无效包记忆（7 天有效，给资源方补档留余地，v1.9.8）。"""
+        try:
+            data = self.get_data(self._DATA_BADPACK) or {}
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        now = int(time.time())
+        all_packs = data.get("packs")
+        if not isinstance(all_packs, dict):
+            all_packs = {}
+        # 顺手清理过期项
+        all_packs = {tid: {c: v for c, v in (p or {}).items()
+                           if now - int((v or {}).get("ts", 0)) < self._BADPACK_TTL}
+                     for tid, p in all_packs.items()}
+        all_packs = {tid: p for tid, p in all_packs.items() if p}
+        packs = all_packs.setdefault(str(tmdbid), {})
+        packs[share_code] = {"ts": now, "miss": miss_brief, "brief": pack_brief}
+        if len(packs) > 20:   # 每剧最多留 20 条，按时间裁最旧
+            packs = dict(sorted(packs.items(),
+                                key=lambda kv: -int(kv[1].get("ts", 0)))[:20])
+            all_packs[str(tmdbid)] = packs
+        data["packs"] = all_packs
+        try:
+            self.save_data(self._DATA_BADPACK, data)
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】无效包记忆保存失败: {e}")
+
+    def __ay_verify_picks(
+            self, tmdbid: int, picks: List[Dict[str, Any]],
+            lack_eps: Set[Tuple[int, int]], title: str
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        转存前验包（v1.9.8）：对选中的 115 分享链接匿名调快照接口核实包内
+        真实集数，不再盲信包名——此前「无标识视为全剧覆盖」会对缺 1 集的剧
+        白拉整季大包（实测 255G 包内只有 E01-E40，缺的 E41 并不在包里）。
+          - 分享码在无效包记忆（7 天）内 → 直接淘汰；
+          - 包内真实集数 ∩ 缺集 = ∅ → 记入无效包记忆并淘汰；
+          - 有交集 → 保留，真实覆盖记到资源 _actual_cover 供覆盖计算使用；
+          - 非 115 链接 / 快照失败 → 保守放行不拉黑，沿用文本估算。
+        返回 (保留的资源列表, 人话说明)。
+        """
+        kept: List[Dict[str, Any]] = []
+        notes: List[str] = []
+        bad = self.__ay_badpack_get(tmdbid)
+        for r in picks:
+            link = str(r.get("link") or "")
+            code, pwd = self.__ay_parse_share(link)
+            if not code:
+                kept.append(r)          # 非 115 分享链接：无法验，放行
+                continue
+            if code in bad:
+                notes.append(f"跳过无效包（{bad[code].get('miss') or '此前验包无所需集'}）")
+                logger.info(f"【{title}】分享码 {code} 在无效包记忆内，跳过")
+                continue
+            names, err = self.__ay_share_files(code, pwd)
+            if names is None:
+                logger.warning(f"【{title}】分享码 {code} 快照验包失败（{err}），"
+                               f"保守放行沿用文本估算")
+                kept.append(r)
+                continue
+            actual = self.__ay_eps_from_names(names)
+            hit = actual & lack_eps
+            brief = self.__ay_eps_brief(actual)
+            if not hit:
+                miss_brief = self.__ay_eps_brief(lack_eps)
+                self.__ay_badpack_add(tmdbid, code, miss_brief, brief)
+                notes.append(f"包内实有 {brief}，无所缺 {miss_brief}，"
+                             f"已跳过并拉黑 7 天")
+                logger.warning(f"【{title}】验包淘汰：包内实有 {brief}，"
+                               f"无所缺 {miss_brief}（分享码 {code} 拉黑 7 天）")
+                continue
+            r["_actual_cover"] = actual
+            notes.append(f"验包通过（包内 {brief}，命中缺集 "
+                         f"{self.__ay_eps_brief(hit)}）")
+            kept.append(r)
+        return kept, "；".join(notes)
 
     @staticmethod
     def __ay_pick_links(
@@ -4066,6 +4294,17 @@ class LackEpisodeAutoSub(_PluginBase):
             resources, self._aiying_api_max_links, lack_eps, season_eps)
         logger.info(f"【{title}】AY API 查到 {len(resources)} 条资源，"
                     f"{pick_reason}，选中 {len(picks)} 条提交 SA 离线")
+        # ---- 2.5 验包（v1.9.8）：115 分享包提交前快照核实包内真实集数 ----
+        if picks and lack_eps:
+            picks, verify_reason = self.__ay_verify_picks(
+                tmdbid, picks, lack_eps, title)
+            if verify_reason:
+                pick_reason = f"{pick_reason}；{verify_reason}"
+                logger.info(f"【{title}】验包：{verify_reason}")
+            if not picks:
+                logger.warning(f"【{title}】验包后无可提交资源（转 PT）")
+                none_result["detail"] = f"AY 包内无所需集数：{verify_reason}"
+                return none_result
 
         # ---- 3. 经 SA 通道提交（v1.8.0：HTTP 直连优先，失败回退 TG）----
         items = [(f"链接{i + 1}", str(r.get("link") or ""))
@@ -4093,8 +4332,12 @@ class LackEpisodeAutoSub(_PluginBase):
         # 真实补齐仍以验证回环复查 Emby 入库为准） ----
         ok_covered: Set[Tuple[int, int]] = set()
         for r in ok_picks:
-            r_text = f"{r.get('name') or ''} {r.get('notes') or ''}"
-            ok_covered |= self.__ay_resource_cover(r_text, season_eps)
+            # v1.9.8：验过包的用真实覆盖，未验的沿用文本估算
+            if r.get("_actual_cover") is not None:
+                ok_covered |= r["_actual_cover"]
+            else:
+                r_text = f"{r.get('name') or ''} {r.get('notes') or ''}"
+                ok_covered |= self.__ay_resource_cover(r_text, season_eps)
         cover = len(ok_covered & lack_eps)
         cover_text = f"预计覆盖 {cover}/{len(lack_eps)} 集"
         logger.info(f"【{title}】AY API 提交结果：{len(ok_picks)}/{len(items)} 条成功，"
