@@ -802,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.9"
+    plugin_version = "1.9.13"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -925,6 +925,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _sa_api_user: str = ""               # SA 登录用户名（默认值已脱敏，请自行填写）
     _sa_api_password: str = ""           # SA 登录密码（同上）
     _sa_api_parent_id: str = ""          # 115 离线目标目录 cid（留空=自动取 folders 第一项）
+    _sa_api_session = None               # SA 专用直连 Session（v1.9.10，trust_env=False，惰性创建）
 
     # 【中转摘集】（v1.9.9 新增；老配置缺字段默认值兜底，向后兼容）
     _pick_prune_enabled: bool = True     # 中转摘集开关
@@ -932,6 +933,34 @@ class LackEpisodeAutoSub(_PluginBase):
     _pick_feed_dir: str = "/CloudNAS/CloudDrive/115open/集合爱影"    # 摘出的缺集投喂给 SA 的目录
     _pick_trash_dir: str = "/CloudNAS/CloudDrive/115open/补集待清理"  # 非缺集暂存（剧完结/到期后清空）
     _pick_stable_min: int = 10           # 文件稳定分钟数：小于该值视为可能在写入，不动
+
+    # 【AI 辅助判集】（v1.9.11 新增；老配置缺字段默认值兜底，向后兼容）
+    # TMDB 某些剧（国漫/综艺尤其多）没有分集或播出日期数据，缺集判不出来；
+    # 开启后把这些季攒成一批问 AI「该季总集数/截至今天已播集数」，用答案回补缺集判定
+    _ai_enabled: bool = False            # AI 辅助判集开关
+    _ai_base_url: str = ""               # OpenAI 兼容接口地址（如 https://api.deepseek.com/v1）
+    _ai_api_key: str = ""                # AI API Key
+    _ai_model: str = ""                  # 模型名（如 deepseek-chat / gpt-4o-mini）
+    _ai_batch_size: int = 10             # 每批最多询问的「季」数
+    _ai_cache_hours: int = 72            # AI 集数答案缓存小时数（缓存期内不重复问）
+    _ai_no_thinking: bool = True         # 关闭推理模型的思考模式（v1.9.13）：DeepSeek-V4 等
+                                         # 推理模型开着思考会把 token 预算耗尽导致正文为空
+    _ai_max_tokens: int = 16000          # 单次请求 max_tokens 上限（防推理吃光预算）
+
+    # 【新发布订阅】（v1.9.11 新增；不限国家，新上映电影/剧集/动漫自动订阅）
+    _new_sub_enabled: bool = False       # 新发布订阅开关
+    _new_sub_cron: str = "33 */3 * * *"  # 新发布发现 cron（默认每 3 小时）
+    _new_sub_types: List[str] = ["movie", "tv", "anime"]  # 订阅类型多选
+    _new_sub_days: int = 3               # 上映日期回看窗口（天）
+    _new_sub_min_vote: float = 0         # 最低评分过滤（0=不过滤）
+    _new_sub_quota: int = 20             # 每日新发布订阅上限（部/天）
+    _new_sub_regions: List[str] = []     # 限定地区多选（REGION_OPTIONS key），空=不限国家
+    _new_sub_pages: int = 2              # 每类拉取页数（20 条/页）
+
+    # AI 辅助判集运行期状态（每轮扫描开始时重置）
+    _ai_pending: List[Dict[str, Any]] = []     # 待 AI 判定的季清单
+    _ai_pending_ids: Set[str] = set()          # 有 AI 待判季的剧（防误写完结账本）
+    _ai_http_session = None                    # AI 专用 Session（惰性创建）
 
     # 持久化数据的 key
     _DATA_PROCESSED = "processed"        # 已处理（已成功订阅）的剧 {tmdbid: {...}}
@@ -948,6 +977,10 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_BADPACK = "aiying_badpack"     # 无效包记忆（v1.9.8）：{tmdbid: {share_code: {ts, miss, brief}}}
     _BADPACK_TTL = 7 * 86400             # 无效包记忆有效期（秒）：给资源方补档留 7 天
     _DATA_PENDING_PICK = "pending_pick"  # 待摘台账（v1.9.9）：{tmdbid: {title, ts, lack, lack_remaining, packs, via, dir_snap}}
+    _DATA_AIEPS = "ai_epcount"           # AI 集数缓存（v1.9.11）：{"tmdbid:season": {total, aired, ts}}
+    _DATA_NEWSUB = "new_sub_done"        # 新发布订阅账本（v1.9.11）：{"mtype:tmdbid": {title, ts}}
+    _DATA_NEWSUB_DAILY = "new_sub_daily" # 新发布当日计数（v1.9.11）：{"date", "count"}
+    _NEWSUB_KEEP_DAYS = 30               # 新发布账本保留天数
 
     # ==================================================================
     # 插件生命周期
@@ -1187,6 +1220,44 @@ class LackEpisodeAutoSub(_PluginBase):
             config.get("pick_trash_dir") or "/CloudNAS/CloudDrive/115open/补集待清理").strip()
         self._pick_stable_min = max(1, self.__to_int(config.get("pick_stable_min"), 10))
 
+        # AI 辅助判集（v1.9.11 新增；老配置缺字段默认值兜底，向后兼容）
+        self._ai_enabled = bool(config.get("ai_enabled", False))
+        self._ai_base_url = str(config.get("ai_base_url") or "").strip()
+        self._ai_api_key = str(config.get("ai_api_key") or "").strip()
+        self._ai_model = str(config.get("ai_model") or "").strip()
+        self._ai_batch_size = max(1, self.__to_int(config.get("ai_batch_size"), 10))
+        self._ai_cache_hours = max(1, self.__to_int(config.get("ai_cache_hours"), 72))
+        # v1.9.13：推理模型默认关思考（否则正文可能被推理 token 吃空）；
+        # 老配置缺该字段时按 True 兜底
+        self._ai_no_thinking = bool(config.get("ai_no_thinking", True))
+        self._ai_max_tokens = max(0, self.__to_int(config.get("ai_max_tokens"), 16000))
+
+        # 新发布订阅（v1.9.11 新增）
+        self._new_sub_enabled = bool(config.get("new_sub_enabled", False))
+        self._new_sub_cron = str(
+            config.get("new_sub_cron") or "33 */3 * * *").strip()
+        try:
+            CronTrigger.from_crontab(self._new_sub_cron)
+        except Exception:
+            logger.warning(f"【{self.plugin_name}】新发布 cron「{self._new_sub_cron}」不合法，"
+                           f"已回退为默认 33 */3 * * *")
+            self._new_sub_cron = "33 */3 * * *"
+        new_types = config.get("new_sub_types") or ["movie", "tv", "anime"]
+        if isinstance(new_types, str):
+            new_types = [t.strip() for t in new_types.split(",") if t.strip()]
+        self._new_sub_types = [t for t in new_types if t in ("movie", "tv", "anime")]
+        self._new_sub_days = max(1, self.__to_int(config.get("new_sub_days"), 3))
+        try:
+            self._new_sub_min_vote = max(0.0, float(config.get("new_sub_min_vote") or 0))
+        except (TypeError, ValueError):
+            self._new_sub_min_vote = 0.0
+        self._new_sub_quota = max(1, self.__to_int(config.get("new_sub_quota"), 20))
+        new_regions = config.get("new_sub_regions") or []
+        if isinstance(new_regions, str):
+            new_regions = [r.strip() for r in new_regions.split(",") if r.strip()]
+        self._new_sub_regions = [r for r in new_regions if r in REGION_OPTIONS]
+        self._new_sub_pages = min(5, max(1, self.__to_int(config.get("new_sub_pages"), 2)))
+
     @staticmethod
     def __to_int(value: Any, default: int) -> int:
         """把配置值安全转成 int，失败用默认值"""
@@ -1310,6 +1381,22 @@ class LackEpisodeAutoSub(_PluginBase):
             "pick_feed_dir": self._pick_feed_dir,
             "pick_trash_dir": self._pick_trash_dir,
             "pick_stable_min": self._pick_stable_min,
+            "ai_enabled": self._ai_enabled,
+            "ai_base_url": self._ai_base_url,
+            "ai_api_key": self._ai_api_key,
+            "ai_model": self._ai_model,
+            "ai_batch_size": self._ai_batch_size,
+            "ai_cache_hours": self._ai_cache_hours,
+            "ai_no_thinking": self._ai_no_thinking,
+            "ai_max_tokens": self._ai_max_tokens,
+            "new_sub_enabled": self._new_sub_enabled,
+            "new_sub_cron": self._new_sub_cron,
+            "new_sub_types": self._new_sub_types,
+            "new_sub_days": self._new_sub_days,
+            "new_sub_min_vote": self._new_sub_min_vote,
+            "new_sub_quota": self._new_sub_quota,
+            "new_sub_regions": self._new_sub_regions,
+            "new_sub_pages": self._new_sub_pages,
         })
 
     def get_state(self) -> bool:
@@ -1320,25 +1407,36 @@ class LackEpisodeAutoSub(_PluginBase):
         """
         注册插件公共服务（cron 定时任务）。
         MP 会在插件启用时按这里返回的 trigger 定时调用 func。
+        v1.9.11：新增「新发布订阅」独立定时任务（自有 cron，默认每 3 小时）。
         """
+        services: List[Dict[str, Any]] = []
         if self._enabled and self._cron:
-            return [{
+            services.append({
                 "id": "LackEpisodeAutoSub",
                 "name": f"{self.plugin_name}定时扫描",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.__scan,
                 "kwargs": {},
-            }]
+            })
         elif self._enabled:
             # 用户没填 cron 时兜底：每天凌晨 4:17
-            return [{
+            services.append({
                 "id": "LackEpisodeAutoSub",
                 "name": f"{self.plugin_name}定时扫描",
                 "trigger": CronTrigger.from_crontab("17 4 * * *"),
                 "func": self.__scan,
                 "kwargs": {},
-            }]
-        return []
+            })
+        # 新发布订阅（独立 cron；仅总开关与新发布开关都开时注册）
+        if self._enabled and self._new_sub_enabled:
+            services.append({
+                "id": "LackEpisodeAutoSubNewRelease",
+                "name": f"{self.plugin_name}新发布订阅",
+                "trigger": CronTrigger.from_crontab(self._new_sub_cron),
+                "func": self.__new_release_scan,
+                "kwargs": {},
+            })
+        return services
 
     def stop_service(self):
         """停止一次性任务的本地调度器（cron 服务由 MP 托管，无需处理）；
@@ -1453,6 +1551,25 @@ class LackEpisodeAutoSub(_PluginBase):
                 "summary": "SA 直连 API 联调测试",
                 "description": "执行登录+取离线目录并返回 {login_ok, folders, parent_id}；"
                                "带 &submit=链接 时真实提交一条（会产生真实离线任务，慎用）",
+            },
+            {
+                "path": "/ai_test",
+                "endpoint": self.api_ai_test,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "AI 辅助判集联调测试",
+                "description": "参数 tmdb_id（可选，默认 333679）+ season（可选，默认 1）。"
+                               "真实调一次配置的 AI 接口问该季集数（不订阅、不写缓存），"
+                               "返回 {ok, answer: {total, aired}, elapsed}",
+            },
+            {
+                "path": "/new_sub_test",
+                "endpoint": self.api_new_sub_test,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "新发布订阅发现预览",
+                "description": "参数 days（可选，覆盖回看窗口）。只做 TMDB 发现与过滤预览，"
+                               "不产生任何订阅；返回各类型候选数与前 20 条明细（含已订阅/已入库标记）",
             },
         ]
 
@@ -1755,6 +1872,9 @@ class LackEpisodeAutoSub(_PluginBase):
         API 端点：SA 直连 API 联调测试（v1.9.2）。
         执行登录 + 取离线目录，返回 {login_ok, folders, parent_id}；
         带 &submit=链接 时真实提交一条（会产生真实离线任务，慎用）。
+        v1.9.10：返回扩展 folders_raw（原始返回）、folders_parsed
+        （解析出的 [(目录名, cid)]）、parent_id_source（配置/缓存/自动/失败），
+        便于核对「转存到对应的位置」是否选对。
         """
         logger.info(f"【{self.plugin_name}】收到 SA 直连联调测试请求"
                     f"{'（含真实提交）' if submit else ''}")
@@ -1764,18 +1884,34 @@ class LackEpisodeAutoSub(_PluginBase):
                     "data": None}
         token = self.__sa_api_login()
         login_ok = bool(token)
-        folders: List[Any] = []
+        folders_raw: Any = None
+        folders_parsed: List[Tuple[str, str]] = []
         parent_id = None
+        parent_id_source = "失败"
         if login_ok:
             ok, data = self.__sa_api_request(
                 "/api/v1/plugin/115/offline/folders", method="get")
             if ok and data:
-                folders = data.get("data") or []
+                folders_raw = data.get("data")
+                folders_parsed = self.__sa_api_parse_folders(data)
+            # 来源先于解析确定（自动选用成功后会写缓存，事后无法区分）
+            if self._sa_api_parent_id:
+                parent_id_source = "配置"
+            elif (self.get_data("sa_api_parent") or {}).get("cid"):
+                parent_id_source = "缓存"
+            else:
+                parent_id_source = "自动（folders 第一项）"
             parent_id = self.__sa_api_parent_id()
+            if not parent_id:
+                parent_id_source = "失败"
         result: Dict[str, Any] = {
             "login_ok": login_ok,
-            "folders": folders,
+            "folders": folders_parsed,          # 兼容老字段含义：目录列表
+            "folders_raw": folders_raw,
+            "folders_parsed": [
+                {"name": n, "cid": c} for n, c in folders_parsed],
             "parent_id": parent_id,
+            "parent_id_source": parent_id_source,
             "submit_result": None,
         }
         # 带 submit 参数：真实提交一条链接（会产生真实离线任务）
@@ -1973,6 +2109,9 @@ class LackEpisodeAutoSub(_PluginBase):
 
         # 候选清单：本轮发现缺集、且通过所有过滤的剧（dict 列表，含优先级判定所需字段）
         candidates: List[Dict[str, Any]] = []
+        # v1.9.11：AI 辅助判集待办清零（TMDB 无分集数据的季在此登记，扫描后成批问 AI）
+        self._ai_pending = []
+        self._ai_pending_ids = set()
 
         for server_name in mediaservers:
             if timeout_hit or manual_stop:
@@ -2104,8 +2243,11 @@ class LackEpisodeAutoSub(_PluginBase):
                             continue
 
                         # ---- 3.2 对比 TMDB 得出缺集（同时拿回 mediainfo 供优先级判定） ----
+                        # v1.9.11：extra 携带年份/定位信息，供 AI 辅助判集登记待办
                         lack_info, tmdbinfo = self.__find_lack_episodes(
-                            tmdbid=tmdbid, title=title, seasoninfo=seasoninfo)
+                            tmdbid=tmdbid, title=title, seasoninfo=seasoninfo,
+                            extra={"year": str(getattr(item, "year", "") or ""),
+                                   "server": server_name, "item_id": item.item_id})
                         if lack_info is None:
                             # 识别/TMDB 请求失败
                             failed += 1
@@ -2116,7 +2258,10 @@ class LackEpisodeAutoSub(_PluginBase):
                             # v1.6.0：TMDB 已完结（Ended/Canceled）且无缺集 -> 写入完结账本，
                             # 之后增量扫描直接跳过。status 取自 __find_lack_episodes 同一次
                             # 识别返回的 tmdbinfo，不额外请求；调试模式不写账本
+                            # v1.9.11：有 AI 待判季的剧不记账本——「不缺集」可能只是
+                            # TMDB 没数据，要等 AI 回补后才能定论
                             if (not self._dry_run and str(tmdbid) not in ledger
+                                    and str(tmdbid) not in self._ai_pending_ids
                                     and (getattr(tmdbinfo, "status", "") or "")
                                     in ("Ended", "Canceled")):
                                 ledger[str(tmdbid)] = {
@@ -2182,6 +2327,19 @@ class LackEpisodeAutoSub(_PluginBase):
         logger.info(f"【{self.plugin_name}】扫描完成：共扫描 {scanned} 部剧，"
                     f"发现缺集 {missing_shows} 部，进入候选 {len(candidates)} 部"
                     f"{'（超时提前收尾）' if timeout_hit else ''}")
+
+        # ---------- 3.2.6 AI 辅助判集回补（v1.9.11）----------
+        # TMDB 无分集/播出日期数据的季，成批问 AI「总集数/已播集数」后回补候选；
+        # AI 未启用/异常时静默跳过，不影响原有候选。调试模式同样执行（只读不写）
+        if self._ai_pending:
+            try:
+                ai_added = self.__ai_resolve_pending(candidates)
+                if ai_added:
+                    missing_shows += ai_added
+                    logger.info(f"【{self.plugin_name}】AI 辅助判集："
+                                f"新增回补候选 {ai_added} 部")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】AI 辅助判集异常（不影响主流程）: {e}")
 
         # ---------- 3.3 优先级排序 ----------
         candidates = self.__sort_candidates(candidates)
@@ -2690,25 +2848,43 @@ class LackEpisodeAutoSub(_PluginBase):
         认领（v1.9.9.1 修订）：不枚举中转根目录（CD2 对 115 系统目录报 EIO），
         改为按包名直查 staging/<share_title>；且目录修改时间不早于提交时间
         （5 分钟容差）。查不到即非本插件的包/包还没到，绝不乱认别人的缓存。
+        v1.9.10：认领失败打一条 INFO 附期望目录名与原因，便于排查
+        「115 落地目录名与分享标题不一致导致永远认不到」的问题。
         """
         want = self.__pick_resolve_title(pack)
         if not want:
+            logger.info(f"【{task.get('title') or tmdbid}】待摘包无可用目录名"
+                        f"（链接 {(pack.get('link') or '')[:60]}），下轮再试")
             return None
         earliest = int(task.get("ts") or 0) - 300
         entry = staging / want
         try:
             if not entry.is_dir():
+                logger.info(f"【{task.get('title') or tmdbid}】中转目录下暂无"
+                            f"「{want}」（包未到或落地名不一致），下轮再看")
                 return None
             if entry.stat().st_mtime < earliest:
+                logger.info(f"【{task.get('title') or tmdbid}】目录「{want}"
+                            f"」早于提交时间，判定非本插件的包，跳过")
                 return None
             return entry
-        except Exception:
+        except Exception as e:
+            logger.info(f"【{task.get('title') or tmdbid}】认领「{want}」异常：{e}")
             return None
 
-    def __pick_move(self, src: Path, dst: Path) -> None:
-        """同盘改名移动（115 服务器端操作，不走带宽）；跨盘兜底 shutil.move。"""
+    def __pick_move(self, src: Path, dst: Path,
+                    keep_on_conflict: bool = False) -> None:
+        """
+        同盘改名移动（115 服务器端操作，不走带宽）；跨盘兜底 shutil.move。
+        目标已存在：缺集文件（keep_on_conflict=True）跳过保留源，
+        交给下轮/人工处理，不擅自删除（v1.9.10 修复：此前直接 unlink 会丢缺集）；
+        非缺集文件维持原样按重复处理删除源。
+        """
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
+            if keep_on_conflict:
+                logger.warning(f"目标已存在，跳过移动保留源文件：{src.name}")
+                raise FileExistsError(str(dst))
             src.unlink()          # 目标已存在：源按重复处理删除
             return
         try:
@@ -2756,13 +2932,15 @@ class LackEpisodeAutoSub(_PluginBase):
             rel = fp.relative_to(pack_dir)
             dst = (feed_root / pack_dir.name / rel) if hit else (trash_root / rel)
             try:
-                self.__pick_move(fp, dst)
+                self.__pick_move(fp, dst, keep_on_conflict=bool(hit))
                 if hit:
                     summary["moved_feed"] += 1
                     lack -= hit
                     logger.info(f"【{title}】摘出缺集 {fp.name} → 投喂 SA")
                 else:
                     summary["moved_trash"] += 1
+            except FileExistsError:
+                files_left += 1    # 目标已存在：缺集文件保留源，下轮再处理
             except Exception as e:
                 files_left += 1
                 logger.error(f"【{title}】移动 {fp.name} 失败: {e}")
@@ -3438,12 +3616,15 @@ class LackEpisodeAutoSub(_PluginBase):
     # 缺集对比 / 订阅
     # ==================================================================
     def __find_lack_episodes(
-        self, tmdbid: int, title: str, seasoninfo: Dict[int, List[int]]
+        self, tmdbid: int, title: str, seasoninfo: Dict[int, List[int]],
+        extra: Optional[Dict[str, Any]] = None
     ) -> Tuple[Optional[Dict[int, List[int]]], Any]:
         """
         对比 TMDB 与 Emby，返回 ({季号: [缺集号,...]}, mediainfo)。
         返回 (None, None) 表示识别/请求失败；返回 ({}, mediainfo) 表示不缺集。
         mediainfo 顺带返回给调用方做优先级判定（避免重复识别）。
+        v1.9.11：extra 可带 {year, server, item_id}，TMDB 无分集数据的季
+        在 AI 辅助判集开启时登记到 _ai_pending，由扫描结束后成批问 AI 回补。
         """
         # 用 MP 媒体链按 TMDB ID 识别（走 MP 内置缓存，速度快）
         try:
@@ -3487,6 +3668,23 @@ class LackEpisodeAutoSub(_PluginBase):
             # 取 TMDB 该季分集，只统计「已播出」的集（未播出的不算缺）
             aired_episodes = self.__get_aired_episodes(tmdbid, season, title, today)
             if not aired_episodes:
+                # v1.9.11：TMDB 无该季分集/播出日期数据（国漫/综艺常见），
+                # AI 辅助判集开启时登记待办，扫描结束后成批问 AI 回补判定
+                if self._ai_enabled:
+                    extra = extra or {}
+                    self._ai_pending.append({
+                        "tmdbid": tmdbid, "title": title,
+                        "year": str(extra.get("year") or ""),
+                        "server": extra.get("server") or "",
+                        "item_id": extra.get("item_id") or "",
+                        "season": season,
+                        "exist": list(seasoninfo.get(season) or []),
+                        "vote": float(getattr(tmdbinfo, "vote_average", 0) or 0),
+                        "genre_ids": list(getattr(tmdbinfo, "genre_ids", None) or []),
+                        "original_language": getattr(tmdbinfo, "original_language", None),
+                        "origin_country": list(getattr(tmdbinfo, "origin_country", None) or []),
+                    })
+                    self._ai_pending_ids.add(str(tmdbid))
                 continue
 
             exist_episodes = seasoninfo.get(season) or []
@@ -4065,8 +4263,8 @@ class LackEpisodeAutoSub(_PluginBase):
                     f"{len(lack_eps)} 集，点击 {res.get('clicks', 0)} 次）")
         # v1.7.0：TG 流程也产出人话明细（渠道详情记录），粒度保留并补充集数
         # v1.9.2：标明 SA 走的哪条路（API/企微提交无回执，措辞用「已提交」）
-        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交"}.get(
-            sa_via, "SA(TG)转存")
+        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交",
+                  "mixed": "SA(API+消息)转存"}.get(sa_via, "SA(TG)转存")
         tg_detail = f"TG 点按钮拿到 {len(items)} 集链接，{sa_tag} {got}/{len(items)} 集"
         if sa_failed:
             tg_detail += f"，失败 {len(sa_failed)} 集"
@@ -4661,17 +4859,22 @@ class LackEpisodeAutoSub(_PluginBase):
                     f"{cover_text}")
 
         # ---- 4.5 记待摘台账（v1.9.9：提交成功即入账，供中转摘集认领） ----
-        if ok_picks and self._pick_prune_enabled:
+        # v1.9.10：只有经 SA 直连 API 离线（落云下载、SA 不监控）的包才需要摘集；
+        # 走企微/TG 消息通道的分享链接由 SA 自己转存并归档，不落入中转站，不入账
+        api_ok_picks = [r for i, r in enumerate(picks) if r.get("link")
+                        and (results.get(f"链接{i + 1}") or {}).get("ok")
+                        and (results.get(f"链接{i + 1}") or {}).get("via") == "api"]
+        if api_ok_picks and self._pick_prune_enabled:
             try:
-                self.__pick_ledger_add(tmdbid, title, lack_eps, ok_picks, sa_via)
+                self.__pick_ledger_add(tmdbid, title, lack_eps, api_ok_picks, sa_via)
             except Exception as e:
                 logger.error(f"【{title}】待摘台账登记失败（不影响主流程）: {e}")
 
         # ---- 5. 人话明细（渠道详情记录，写历史与汇总通知用） ----
         ok_n = len(ok_picks)
         # v1.9.2：明细里标明 SA 走了哪条路（API/企微提交无回执，措辞用「已提交」）
-        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交"}.get(
-            sa_via, "SA(TG)已提交")
+        sa_tag = {"api": "SA(API)已提交", "http": "SA(企微)已提交",
+                  "mixed": "SA(API+消息)已提交"}.get(sa_via, "SA(TG)已提交")
         if ok_picks:
             first = ok_picks[0]
             first_desc = (first.get("notes") or first.get("name") or "")[:60]
@@ -4705,6 +4908,19 @@ class LackEpisodeAutoSub(_PluginBase):
     # ==================================================================
     # SA HTTP 直连转存（v1.8.0 新增）：企业微信回调协议（WXBizMsgCrypt）
     # ==================================================================
+    def __sa_http(self) -> requests.Session:
+        """
+        SA 专用 Session（v1.9.10）：trust_env=False 强制直连，忽略容器
+        HTTP(S)_PROXY/ALL_PROXY 环境变量。SA 一般在本机/内网（默认
+        127.0.0.1:8095），裸 requests 会把请求甩给代理出口导致连接失败/401，
+        与 AY 侧 v1.9.7 的修复同理（__ay_http）。
+        """
+        if not self._sa_api_session:
+            session = requests.Session()
+            session.trust_env = False
+            self._sa_api_session = session
+        return self._sa_api_session
+
     def __sa_http_ready(self) -> bool:
         """SA HTTP 通道是否可用：总开关开 + pycryptodome 可用 + 关键配置齐全"""
         return bool(self._sa_http_enabled and _CRYPTO_OK
@@ -4755,7 +4971,8 @@ class LackEpisodeAutoSub(_PluginBase):
                 f"<AgentID><![CDATA[{self._sa_http_agentid}]]></AgentID></xml>")
             # 注意：URL query 里的 token=symedia 是 SA 路由标识（固定值），
             # 与签名用的 sa_http_token 是两回事
-            resp = requests.post(
+            # v1.9.10：走 SA 专用直连 Session（trust_env=False），防容器代理截胡内网回调
+            resp = self.__sa_http().post(
                 self._sa_http_url,
                 params={"token": "symedia", "msg_signature": sig,
                         "timestamp": ts, "nonce": nonce},
@@ -4835,7 +5052,7 @@ class LackEpisodeAutoSub(_PluginBase):
                             return cached["token"]
                     except (TypeError, ValueError):
                         pass
-            resp = requests.post(
+            resp = self.__sa_http().post(
                 self._sa_api_url.rstrip("/") + "/api/v1/login/access-token",
                 data={"username": self._sa_api_user,
                       "password": self._sa_api_password},
@@ -4872,7 +5089,7 @@ class LackEpisodeAutoSub(_PluginBase):
             if not token:
                 return False, None
             try:
-                resp = requests.request(
+                resp = self.__sa_http().request(
                     method, self._sa_api_url.rstrip("/") + path,
                     headers={"Authorization": f"Bearer {token}"},
                     json=json_body, timeout=30)
@@ -4890,10 +5107,47 @@ class LackEpisodeAutoSub(_PluginBase):
                 return False, None
         return False, None
 
+    @staticmethod
+    def __sa_api_parse_folders(payload: Optional[dict]) -> List[Tuple[str, str]]:
+        """
+        把 SA folders 接口的返回解析成 [(目录名, cid)]（v1.9.10 抽出，兼容多结构）。
+        实测/可能的形态都兜住：
+          ① data: [["云下载", "123"], ...]            —— v1.9.2 联调时的形态
+          ② data: [{"name"/"file_name", "cid"/"id"}, ...]
+          ③ data: {"folders": ①或②}
+        解析不出来的条目跳过；全空返回 []。
+        """
+        def _pairs(items: Any) -> List[Tuple[str, str]]:
+            out: List[Tuple[str, str]] = []
+            if not isinstance(items, list):
+                return out
+            for it in items:
+                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                    name, cid = it[0], it[1]
+                elif isinstance(it, dict):
+                    name = (it.get("name") or it.get("file_name")
+                            or it.get("title") or "")
+                    cid = (it.get("cid") or it.get("id")
+                           or it.get("file_id") or "")
+                else:
+                    continue
+                cid = str(cid or "").strip()
+                if cid:
+                    out.append((str(name or ""), cid))
+            return out
+
+        data = (payload or {}).get("data")
+        folders = _pairs(data)
+        if not folders and isinstance(data, dict):
+            folders = _pairs(data.get("folders"))
+        return folders
+
     def __sa_api_parent_id(self) -> Optional[str]:
         """
         解析 115 离线目标目录 cid（v1.9.2）：配置优先；留空则取 folders
         第一项并缓存到 plugindata（目录很少变，避免每次提交都查）。
+        v1.9.10：返回结构解析抽成 __sa_api_parse_folders 兼容多形态；
+        解析失败打原始返回摘要，自动选用时列出全部候选目录便于核对位置。
         """
         if self._sa_api_parent_id:
             return self._sa_api_parent_id
@@ -4903,28 +5157,52 @@ class LackEpisodeAutoSub(_PluginBase):
         ok, data = self.__sa_api_request(
             "/api/v1/plugin/115/offline/folders", method="get")
         if ok and data:
-            folders = data.get("data") or []
-            if folders and isinstance(folders[0], (list, tuple)) \
-                    and len(folders[0]) >= 2:
-                cid = str(folders[0][1])
+            folders = self.__sa_api_parse_folders(data)
+            if folders:
+                names = "、".join(n or "(未命名)" for n, _ in folders)
+                cid = folders[0][1]
                 try:
                     self.save_data("sa_api_parent",
-                                   {"cid": cid, "name": str(folders[0][0])})
+                                   {"cid": cid, "name": folders[0][0]})
                 except Exception:
                     pass
-                logger.info(f"【{self.plugin_name}】SA 离线目标目录自动选用："
-                            f"{folders[0][0]}（cid={cid}）")
+                logger.info(f"【{self.plugin_name}】SA 离线可选目录：{names}；"
+                            f"自动选用：{folders[0][0]}（cid={cid}），"
+                            f"如位置不对请在配置里显式填写目标目录 cid")
                 return cid
-        logger.error(f"【{self.plugin_name}】SA 离线目标目录获取失败")
+            logger.error(f"【{self.plugin_name}】SA 离线目标目录解析失败，"
+                         f"原始返回：{str(data)[:200]}")
+        else:
+            logger.error(f"【{self.plugin_name}】SA 离线目标目录获取失败"
+                         f"（请求未成功或无返回）")
         return None
+
+    @staticmethod
+    def __sa_api_judge(resp: dict) -> Tuple[bool, str]:
+        """
+        判定 SA 离线提交回执是否成功（v1.9.10 抽出，纯函数便于核对）。
+        规则：
+          ① message 含「任务已存在」/「已经转存过」→ 成功（内容已在库，
+            即使 SA 把整句写成「115离线下载失败：任务已存在」）；
+          ② success 为真 且 message 不含「失败」→ 成功
+            （不再死抠「离线成功/转存成功」字样，SA 回执措辞改版不再误判）；
+          ③ 其余 → 失败，原因取 message。
+        """
+        msg = str((resp or {}).get("message") or "")
+        if "任务已存在" in msg or "已经转存过" in msg:
+            return True, msg
+        if (resp or {}).get("success") and "失败" not in msg:
+            return True, msg
+        return False, msg
 
     def __sa_api_submit(self, links: List[str], title: str) -> Dict[str, Any]:
         """
         经 SA 直连 API 提交离线下载（v1.9.2，协议已实测）。
         POST /api/v1/plugin/115/offline，magnets 一次提交全部链接
         （ed2k 与 115 分享链接同接口都支持）。
-        message 判定：含「任务已存在」/「已经转存过」→ 算成功（内容已在库）；
-        含「离线成功」/「转存成功」→ 成功；其他（含「失败」字样）→ 失败。
+        v1.9.10：成功判定抽成 __sa_api_judge——success 为真且 message 无「失败」
+        即算成功（此前死抠「离线成功/转存成功」字样，SA 回执措辞稍异就误判失败，
+        空转企微/TG 回退链）；「任务已存在/已经转存过」仍优先按成功处理。
         message 是汇总的：汇总成功则全部 ok；判定失败整体 not ok
         （调用方回退企微通道重提，SA 对已有任务返回「任务已存在」无副作用）。
         返回形状与 __sa_http_submit 对齐并附 via="api"。
@@ -4939,63 +5217,107 @@ class LackEpisodeAutoSub(_PluginBase):
         if not ok or resp is None:
             return {"ok": False, "sent": 0, "failed": len(links), "via": "api",
                     "detail": "SA(API) 提交请求失败（网络/鉴权）"}
-        msg = str(resp.get("message") or "")
-        # v1.9.2 修正：「任务已存在/已经转存过」优先于「失败」字样判定
-        # （SA 的回执形如「115离线下载失败：任务已存在」，实为内容已在库的成功态）
-        _already = ("任务已存在" in msg) or ("已经转存过" in msg)
-        success = bool(resp.get("success")) and (
-            _already
-            or ("失败" not in msg and (
-                ("离线成功" in msg) or ("转存成功" in msg))))
+        success, msg = self.__sa_api_judge(resp)
+        logger.info(f"【{title}】SA(API) 提交回执：success={resp.get('success')}，"
+                    f"message={msg or '(空)'}，判定={'成功' if success else '失败'}")
         if success:
             return {"ok": True, "sent": len(links), "failed": 0, "via": "api",
-                    "detail": f"SA(API)已提交 {len(links)} 条（{msg[:40]}）"}
+                    "detail": f"SA(API)已提交 {len(links)} 条（{msg[:120] or '无回执'}）"}
         return {"ok": False, "sent": 0, "failed": len(links), "via": "api",
-                "detail": f"SA(API) 提交失败：{msg[:60] or '无响应 message'}"}
+                "detail": f"SA(API) 提交失败：{msg[:120] or '无响应 message'}"}
+
+    @staticmethod
+    def __sa_is_offline_link(url: str) -> bool:
+        """
+        该链接是否适合走 SA 直连离线接口（v1.9.10）。
+        SA 的 /plugin/115/offline 只吃得下磁力/ed2k（SA 前端注明「磁力链接，
+        一行一个」）；把 115 分享链接喂给它会被当成普通网址下载——实测提交
+        3 条分享链接，云下载落 3 个 ~26KB 的 115 分享页 HTML 文件，SA 还回
+        「离线成功」造成假象。分享转存必须走 SA 的消息通道（企微/TG，SA 内部
+        走 share_transfer，回执「已经转存过该文件」，真实入 115）。
+        """
+        u = (url or "").strip().lower()
+        return u.startswith("ed2k://") or u.startswith("magnet:")
 
     def __sa_submit(self, items: List[Tuple[str, str]],
                     title: str) -> Dict[str, Any]:
         """
-        SA 提交包装层：三级回退（v1.9.2）。
-          ① sa_api 三件套齐全 → 直连 API（最高优先级）；
-          ② 失败/未配 → 企微回调通道（v1.8.0）；
-          ③ 再失败/未配 → TG 机器人提交（v1.4.0）。
-        返回形状与 mgr.submit 对齐：{"ok", "results": {label: {ok, msg}}, "via"}，
-        via = api / http / tg，调用方据此在人话明细里区分
-        SA(API)/SA(企微)/SA(TG)。
+        SA 提交包装层（v1.9.10 由三级回退修订为按链接类型分流）：
+          - 磁力/ed2k → 直连 API 离线（/plugin/115/offline，真下载）；
+            未配或失败时回落消息通道；
+          - 115 分享链接/其他 http(s) → 企微回调（v1.8.0）→ TG 机器人（v1.4.0），
+            SA 消息通道做分享转存；通道内失败该类整体回退下一级
+            （SA 对重复任务回「任务已存在」，重提无副作用）。
+        返回 {"ok", "via", "results": {label: {ok, msg, via}}}；
+        via = api / http / tg / mixed（离线+消息混用时），results 每条带自己的 via。
+        ok 判定：至少一条成功即为 True（部分失败走调用方的 partial 逻辑），
+        全败/无通道可用才为 False（调用方转 PT）。
         """
-        # ---- ① 直连 API ----
-        if self.__sa_api_ready():
-            links = [u for _, u in items if u]
-            r = self.__sa_api_submit(links, title)
+        results: Dict[str, Dict[str, Any]] = {}
+        used: List[str] = []
+        offline_items = [(l, u) for l, u in items
+                         if u and self.__sa_is_offline_link(u)]
+        rest = [(l, u) for l, u in items
+                if u and not self.__sa_is_offline_link(u)]
+
+        # ---- 磁力/ed2k：直连 API 离线优先 ----
+        if offline_items:
+            if self.__sa_api_ready():
+                r = self.__sa_api_submit([u for _, u in offline_items], title)
+                if r["ok"]:
+                    used.append("api")
+                    logger.info(f"【{title}】{r['detail']}（不等离线结果，"
+                                f"交由入库验证回环确认）")
+                    for label, _ in offline_items:
+                        results[label] = {"ok": True, "msg": "SA(API)已提交",
+                                          "via": "api"}
+                else:
+                    logger.warning(f"【{title}】{r['detail']}，"
+                                   f"磁力/ed2k 回落消息通道")
+                    rest += offline_items
+            else:
+                rest += offline_items
+
+        # ---- 分享链接（及回落链接）：企微 → TG ----
+        if rest and self.__sa_http_ready():
+            r = self.__sa_http_submit(rest, title)
             if r["ok"]:
+                used.append("http")
                 logger.info(f"【{title}】{r['detail']}（不等离线结果，"
                             f"交由入库验证回环确认）")
-                return {"ok": True, "via": "api",
-                        "results": {label: {"ok": True, "msg": "SA(API)已提交"}
-                                    for label, _ in items}}
-            logger.warning(f"【{title}】{r['detail']}，回退企微通道")
-        # ---- ② 企微回调通道 ----
-        if self.__sa_http_ready():
-            r = self.__sa_http_submit(items, title)
-            if r["ok"]:
-                # 提交无回执可等（SA 异步离线）：标「已提交待验证」，
-                # 由入库验证回环兜底确认；TG 会话在时用户也会收到 SA 自己的
-                # TG 通知（带外渠道），插件不再监听
-                logger.info(f"【{title}】{r['detail']}（不等离线结果，"
-                            f"交由入库验证回环确认）")
-                return {"ok": True, "via": "http",
-                        "results": {label: {"ok": True, "msg": "SA(企微)已提交"}
-                                    for label, _ in items}}
-            logger.warning(f"【{title}】{r['detail']}，回退 TG 提交")
-        # ---- ③ 回退/默认：TG 提交（Telethon 发 SA 机器人并等回执） ----
-        mgr = self.__get_tg()
-        if not mgr:
-            return {"ok": False, "via": "tg", "error": "TG 管理器不可用",
+                for label, _ in rest:
+                    results[label] = {"ok": True, "msg": "SA(企微)已提交",
+                                      "via": "http"}
+                rest = []
+            else:
+                logger.warning(f"【{title}】{r['detail']}，回退 TG 提交")
+        if rest:
+            mgr = self.__get_tg()
+            if not mgr:
+                logger.error(f"【{title}】TG 管理器不可用，"
+                             f"{len(rest)} 条链接无法提交")
+                for label, _ in rest:
+                    results[label] = {"ok": False, "msg": "TG 管理器不可用",
+                                      "via": "tg"}
+            else:
+                used.append("tg")
+                sub = mgr.submit(self._sa_bot, rest,
+                                 interval=self._aiying_interval)
+                sub_results = sub.get("results") or {}
+                for label, _ in rest:
+                    r = sub_results.get(label) or {}
+                    results[label] = {
+                        "ok": bool(r.get("ok")),
+                        "msg": r.get("msg") or sub.get("error") or "TG 提交失败",
+                        "via": "tg",
+                    }
+
+        if not results:
+            return {"ok": False, "via": "tg", "error": "无可提交链接",
                     "results": {}}
-        sub = mgr.submit(self._sa_bot, items, interval=self._aiying_interval)
-        sub["via"] = "tg"
-        return sub
+        ok_any = any(r.get("ok") for r in results.values())
+        via = used[0] if len(set(used)) == 1 else "mixed"
+        return {"ok": ok_any, "via": via, "results": results}
 
     def __unsub_pt_if_115(self, entry: Dict[str, Any], title: str,
                           history: List[Dict[str, Any]]):
@@ -5046,6 +5368,549 @@ class LackEpisodeAutoSub(_PluginBase):
                 history, title=title, year=str(entry.get("year", "")),
                 tmdbid=tmdbid, lack_info={}, missing_count=0,
                 result="退订PT", message=f"115 已补齐，退订 PT 订阅 {removed} 季")
+
+    # ==================================================================
+    # AI 辅助判集（v1.9.11）：TMDB 无分集数据的季成批问 AI 集数后回补缺集
+    # ==================================================================
+    def __ai_ready(self) -> bool:
+        """AI 辅助判集是否可用（开关+三件套齐全）"""
+        return bool(self._ai_enabled and self._ai_base_url
+                    and self._ai_api_key and self._ai_model)
+
+    def __ai_http(self) -> requests.Session:
+        """AI 专用 Session（惰性创建）。沿用容器代理环境变量——
+        境外服务（OpenAI 等）需要代理；国内服务经代理规则一般也能直连，
+        与 AY 的家宽白名单场景不同，无需强制直连"""
+        if not self._ai_http_session:
+            self._ai_http_session = requests.Session()
+        return self._ai_http_session
+
+    def __ai_cache_get(self, tmdbid: int, season: int) -> Optional[Dict[str, int]]:
+        """读 AI 集数缓存；无记录或超过缓存时长返回 None"""
+        try:
+            cache = self.get_data(self._DATA_AIEPS) or {}
+            ent = cache.get(f"{tmdbid}:{season}")
+            if not ent:
+                return None
+            if time.time() - float(ent.get("ts", 0)) > self._ai_cache_hours * 3600:
+                return None
+            return {"total": int(ent.get("total") or 0),
+                    "aired": int(ent.get("aired") or 0)}
+        except Exception:
+            return None
+
+    def __ai_cache_put(self, tmdbid: int, season: int, ans: Dict[str, int]):
+        """写 AI 集数缓存；超过 2000 条时按时间裁掉最旧的一半防膨胀"""
+        try:
+            cache = self.get_data(self._DATA_AIEPS) or {}
+            cache[f"{tmdbid}:{season}"] = {
+                "total": int(ans.get("total") or 0),
+                "aired": int(ans.get("aired") or 0),
+                "ts": int(time.time()),
+            }
+            if len(cache) > 2000:
+                cache = dict(sorted(cache.items(),
+                                    key=lambda kv: kv[1].get("ts", 0),
+                                    reverse=True)[:1000])
+            self.save_data(self._DATA_AIEPS, cache)
+        except Exception as e:
+            logger.debug(f"【{self.plugin_name}】AI 集数缓存写入失败（不影响）: {e}")
+
+    def __ai_batch_query(self, items: List[Dict[str, Any]]) -> Dict[Tuple[int, int], Dict[str, int]]:
+        """
+        成批问 AI 每季集数（v1.9.11 核心）。一次请求问一批「季」，
+        返回 {(tmdbid, season): {"total": 总集数, "aired": 截至今天已播集数}}。
+        网络/HTTP/解析异常一律抛出，由调用方决定跳过本批。
+        """
+        if not self.__ai_ready():
+            raise ValueError("AI 辅助判集未启用或配置不完整")
+        today = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
+        lines = "\n".join(
+            f'- tmdbid={it["tmdbid"]} 《{it["title"]}》'
+            f'({it.get("year") or "年份未知"}) 第{it["season"]}季'
+            for it in items)
+        prompt = (
+            f"你是剧集资料助手。今天是 {today}。\n"
+            "请给出下面每一部剧集指定季的总集数和截至今天已播出的集数。\n"
+            "只返回 JSON，不要输出任何其他文字或解释，格式：\n"
+            '{"results":[{"tmdbid":123,"season":1,"total":12,"aired":12}]}\n'
+            "规则：total 与 aired 都是整数；aired 不能超过 total；"
+            "确实不知道的条目 total 和 aired 都填 0。\n"
+            f"剧集列表：\n{lines}")
+        url = self._ai_base_url.rstrip("/") + "/chat/completions"
+        payload = {"model": self._ai_model,
+                   "messages": [{"role": "user", "content": prompt}],
+                   "temperature": 0}
+        if self._ai_max_tokens > 0:
+            payload["max_tokens"] = self._ai_max_tokens
+        if self._ai_no_thinking:
+            # DeepSeek-V4 等推理模型：关闭思考，防止推理 token 耗尽预算导致正文为空
+            payload["thinking"] = {"type": "disabled"}
+        resp = self.__ai_http().post(
+            url,
+            headers={"Authorization": f"Bearer {self._ai_api_key}"},
+            json=payload,
+            timeout=(15, 300))
+        if resp.status_code == 400 and "thinking" in payload:
+            # 部分 OpenAI 兼容服务不认识 thinking 参数：去掉后自动重试一次
+            logger.warning(f"【{self.plugin_name}】AI 服务拒绝 thinking 参数"
+                           f"（HTTP 400），本批改用兼容模式重试")
+            payload.pop("thinking")
+            resp = self.__ai_http().post(
+                url,
+                headers={"Authorization": f"Bearer {self._ai_api_key}"},
+                json=payload,
+                timeout=(15, 300))
+        resp.raise_for_status()
+        rj = resp.json()
+        ch = (rj.get("choices") or [{}])[0]
+        content = (ch.get("message") or {}).get("content") or ""
+        results = self.__ai_parse_results(content, items)
+        if not results:
+            # 0 解析诊断：推理耗尽/内容截断/格式异常时留下现场
+            usage = rj.get("usage") or {}
+            rtk = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            logger.warning(f"【{self.plugin_name}】AI 本批解析到 0 条："
+                           f"finish_reason={ch.get('finish_reason')} "
+                           f"completion_tokens={usage.get('completion_tokens')} "
+                           f"reasoning_tokens={rtk} "
+                           f"content前200字={content[:200]!r}")
+        return results
+
+    @staticmethod
+    def __ai_parse_results(content: str, items: List[Dict[str, Any]]
+                           ) -> Dict[Tuple[int, int], Dict[str, int]]:
+        """
+        解析 AI 返回的 JSON（纯函数可独立测试）。防御性：
+        容许 ```json 包裹/前后废话（取首个 { 到末个 }）；
+        只接受本批询问过的 (tmdbid, season)；total/aired 收敛到 0..500，
+        aired 不超过 total；非法条目跳过。
+        """
+        results: Dict[Tuple[int, int], Dict[str, int]] = {}
+        m = re.search(r"\{.*\}", content or "", re.S)
+        if not m:
+            return results
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return results
+        rows = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return results
+        wanted = {(int(it["tmdbid"]), int(it["season"])) for it in items}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                tid = int(r.get("tmdbid"))
+                s = int(r.get("season"))
+                total = int(r.get("total") or 0)
+                aired = int(r.get("aired") or 0)
+            except (TypeError, ValueError):
+                continue
+            if (tid, s) not in wanted:
+                continue
+            total = min(500, max(0, total))
+            aired = min(total, max(0, aired))
+            results[(tid, s)] = {"total": total, "aired": aired}
+        return results
+
+    def __ai_resolve_pending(self, candidates: List[Dict[str, Any]]) -> int:
+        """
+        扫描结束后统一处理 AI 待判季：先查缓存，缓存未命中分批问 AI，
+        再用 AI 答案（已播集数）与该季 Emby 已有集对比得出缺集，
+        并入已有候选或新增候选。返回新增候选部数。
+        任何单季失败只跳过该季，不影响其他。
+        """
+        if not self.__ai_ready():
+            logger.info(f"【{self.plugin_name}】AI 辅助判集未启用/未配置，"
+                        f"{len(self._ai_pending)} 个待判季维持跳过")
+            return 0
+        answers: Dict[Tuple[int, int], Dict[str, int]] = {}
+        todo: List[Dict[str, Any]] = []
+        for it in self._ai_pending:
+            cached = self.__ai_cache_get(it["tmdbid"], it["season"])
+            if cached is not None:
+                answers[(it["tmdbid"], it["season"])] = cached
+            else:
+                todo.append(it)
+        if todo:
+            logger.info(f"【{self.plugin_name}】AI 辅助判集：缓存命中 "
+                        f"{len(self._ai_pending) - len(todo)} 季，待问 AI {len(todo)} 季")
+        batch = max(1, self._ai_batch_size)
+        total_batches = (len(todo) + batch - 1) // batch
+        for i in range(0, len(todo), batch):
+            chunk = todo[i:i + batch]
+            bn = i // batch + 1
+            logger.info(f"【{self.plugin_name}】AI 批次 {bn}/{total_batches}："
+                        f"询问 {len(chunk)} 季，等待响应（推理模型可能需数分钟）…")
+            _t0 = time.monotonic()
+            try:
+                res = self.__ai_batch_query(chunk)
+                logger.info(f"【{self.plugin_name}】AI 批次 {bn}/{total_batches} 返回："
+                            f"解析到 {len(res)}/{len(chunk)} 季，"
+                            f"耗时 {time.monotonic() - _t0:.1f}s")
+                for key, val in res.items():
+                    answers[key] = val
+                    self.__ai_cache_put(key[0], key[1], val)
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】AI 批次 {bn}/{total_batches} 失败"
+                             f"（本批 {len(chunk)} 季跳过，"
+                             f"耗时 {time.monotonic() - _t0:.1f}s）: {e}")
+        added = 0
+        for it in self._ai_pending:
+            ans = answers.get((it["tmdbid"], it["season"]))
+            aired_n = int((ans or {}).get("aired") or 0)
+            if aired_n <= 0:
+                logger.info(f"【{it['title']}】AI 无法确定第 {it['season']} 季"
+                            f"已播集数，维持跳过")
+                continue
+            aired_eps = set(range(1, min(aired_n, 500) + 1))
+            lack_eps = sorted(aired_eps - set(it.get("exist") or []))
+            if not lack_eps:
+                continue
+            cand = next((c for c in candidates if c["tmdbid"] == it["tmdbid"]), None)
+            if cand:
+                # 该剧已因其他季缺集入候选：把 AI 季并进来（取并集）
+                merged = sorted(set(cand["lack_info"].get(it["season"]) or [])
+                                | set(lack_eps))
+                new_missing = cand["missing"] - len(
+                    cand["lack_info"].get(it["season"]) or []) + len(merged)
+                if self._max_missing > 0 and new_missing > self._max_missing:
+                    logger.warning(f"【{it['title']}】AI 并入后缺集 {new_missing} 集"
+                                   f"超过上限，保持原候选不变")
+                    continue
+                cand["lack_info"][it["season"]] = merged
+                cand["missing"] = new_missing
+                cand["ai_assist"] = True
+                logger.info(f"【{it['title']}】AI 辅助：第 {it['season']} 季按已播 "
+                            f"{aired_n} 集判定，并入已有候选（该季缺 {len(lack_eps)} 集）")
+                continue
+            if self._max_missing > 0 and len(lack_eps) > self._max_missing:
+                logger.warning(f"【{it['title']}】AI 判缺 {len(lack_eps)} 集超过上限 "
+                               f"{self._max_missing}，跳过（请人工确认）")
+                continue
+            candidates.append({
+                "title": it["title"], "year": it.get("year", ""),
+                "tmdbid": it["tmdbid"], "lack_info": {it["season"]: lack_eps},
+                "missing": len(lack_eps),
+                "server": it.get("server", ""), "item_id": it.get("item_id", ""),
+                "vote": it.get("vote", 0.0), "genre_ids": it.get("genre_ids", []),
+                "original_language": it.get("original_language"),
+                "origin_country": it.get("origin_country", []),
+                "ai_assist": True,
+            })
+            added += 1
+            logger.info(f"【{it['title']}】AI 辅助：第 {it['season']} 季按已播 "
+                        f"{aired_n} 集判定，新增候选（缺 {len(lack_eps)} 集）")
+        return added
+
+    # ==================================================================
+    # 新发布订阅（v1.9.11）：TMDB 日期窗发现 + 自动订阅（默认不限国家）
+    # ==================================================================
+    def __new_release_scan(self):
+        """
+        新发布订阅定时任务（独立 cron 触发）：
+        按配置类型从 TMDB 发现近 N 天新上映的电影/剧集/动漫，
+        去重（账本+已有订阅）后按每日配额自动订阅（剧集订第 1 季）。
+        每一步独立 try/except，失败只记日志。
+        """
+        if not self._enabled or not self._new_sub_enabled:
+            return
+        start_time = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+        logger.info(f"【{self.plugin_name}】===== 开始一轮新发布订阅 ====="
+                    f"{'（调试模式：仅记录不订阅）' if self._dry_run else ''}")
+        try:
+            found = self.__new_sub_discover()
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】新发布发现阶段异常: {e}")
+            return
+        if not found:
+            logger.info(f"【{self.plugin_name}】新发布发现：窗口内无候选，本轮结束")
+            return
+
+        done: Dict[str, Any] = self.get_data(self._DATA_NEWSUB) or {}
+        daily: Dict[str, Any] = self.get_data(self._DATA_NEWSUB_DAILY) or {}
+        today_str = self.__today_str()
+        day_count = int(daily.get("count") or 0) if daily.get("date") == today_str else 0
+        history: List[Dict[str, Any]] = self.get_data(self._DATA_HISTORY) or []
+        subscribed_titles: List[str] = []
+        skipped = 0
+        failed = 0
+
+        for cand in found:
+            if day_count >= self._new_sub_quota:
+                logger.info(f"【{self.plugin_name}】新发布当日配额 {self._new_sub_quota} "
+                            f"已用完，剩余候选留待下轮")
+                break
+            key = f"{cand['mtype']}:{cand['tmdbid']}"
+            if key in done:
+                continue
+            # 已有订阅跳过（剧集看第 1 季，电影看整部）
+            try:
+                if cand["mtype"] == "movie":
+                    exists = self._subOper.exists(cand["tmdbid"], None)
+                else:
+                    exists = self._subOper.exists(cand["tmdbid"], None, season=1)
+                if exists:
+                    skipped += 1
+                    continue
+            except Exception as e:
+                logger.debug(f"【{cand['title']}】查询订阅状态失败（按未订阅处理）: {e}")
+
+            if self._dry_run:
+                logger.info(f"【{cand['title']}】[调试] 新发布将订阅 "
+                            f"{cand['mtype']}（评分 {cand.get('vote', 0)}）")
+                continue
+
+            try:
+                if cand["mtype"] == "movie":
+                    sid, msg = self._subChain.add(
+                        title=cand["title"], year=cand["year"],
+                        mtype=MediaType.MOVIE, tmdbid=cand["tmdbid"],
+                        exist_ok=True, username=self.plugin_name, message=False,
+                        best_version=1 if self._best_version else 0)
+                else:
+                    sid, msg = self._subChain.add(
+                        title=cand["title"], year=cand["year"],
+                        mtype=MediaType.TV, tmdbid=cand["tmdbid"], season=1,
+                        exist_ok=True, username=self.plugin_name, message=False,
+                        best_version=1 if self._best_version else 0)
+                if sid:
+                    day_count += 1
+                    done[key] = {"title": cand["title"],
+                                 "ts": int(time.time())}
+                    subscribed_titles.append(
+                        f"{cand['title']} ({cand['year']}) "
+                        f"[{cand['kind']}] 评分 {cand.get('vote', 0)}")
+                    logger.info(f"【{cand['title']}】新发布订阅成功 (sid={sid})")
+                    self.__append_history(
+                        history, title=cand["title"], year=cand["year"],
+                        tmdbid=cand["tmdbid"], lack_info={}, missing_count=0,
+                        result="新发布订阅",
+                        message=f"{cand['kind']}，评分 {cand.get('vote', 0)}，sid={sid}",
+                        channel="new_sub")
+                else:
+                    failed += 1
+                    logger.warning(f"【{cand['title']}】新发布订阅失败: {msg}")
+            except Exception as e:
+                failed += 1
+                logger.error(f"【{cand['title']}】新发布订阅异常: {e}")
+            if self._subscribe_interval > 0:
+                time.sleep(self._subscribe_interval)
+
+        # 落盘账本（裁剪 30 天前旧记录）与当日计数
+        try:
+            cutoff = int(time.time()) - self._NEWSUB_KEEP_DAYS * 86400
+            done = {k: v for k, v in done.items()
+                    if int(v.get("ts", 0)) >= cutoff}
+            self.save_data(self._DATA_NEWSUB, done)
+            self.save_data(self._DATA_NEWSUB_DAILY,
+                           {"date": today_str, "count": day_count})
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】新发布账本保存失败（不影响主流程）: {e}")
+
+        elapsed = (datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                   - start_time).total_seconds()
+        logger.info(f"【{self.plugin_name}】===== 新发布订阅本轮结束："
+                    f"候选 {len(found)} 部，订阅 {len(subscribed_titles)} 部，"
+                    f"跳过 {skipped} 部，失败 {failed} 部，耗时 {elapsed:.0f} 秒 =====")
+        if self._notify and subscribed_titles:
+            try:
+                lines = [f"本轮新订阅 {len(subscribed_titles)} 部："]
+                for t in subscribed_titles[:10]:
+                    lines.append(f"· {t}")
+                if len(subscribed_titles) > 10:
+                    lines.append(f"· …等共 {len(subscribed_titles)} 部")
+                self.post_message(
+                    mtype=NotificationType.SiteMessage,
+                    title=f"【{self.plugin_name}】新发布订阅完成",
+                    text="\n".join(lines))
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】新发布汇总通知发送失败: {e}")
+
+    def __new_sub_discover(self, days: int = 0) -> List[Dict[str, Any]]:
+        """
+        从 TMDB 发现近 N 天新上映内容（days=0 用配置窗口）。
+        返回 [{mtype, tmdbid, title, year, vote, kind}]，按评分降序去重。
+        类型映射：movie→电影（排除动画）；tv→剧集（排除动画）；
+        anime→动漫（剧集+电影里 genre=16 的）。
+        """
+        today = datetime.datetime.now(tz=pytz.timezone(settings.TZ)).date()
+        window = max(1, days or self._new_sub_days)
+        date_to = today.strftime("%Y-%m-%d")
+        date_from = (today - datetime.timedelta(days=window)).strftime("%Y-%m-%d")
+        jobs: List[Tuple[str, str, str, str]] = []  # (mtype, with_genres, without_genres, kind)
+        types = self._new_sub_types or []
+        if "movie" in types:
+            jobs.append(("movie", "", str(GENRE_ID_ANIMATION), "电影"))
+        if "tv" in types:
+            jobs.append(("tv", "", str(GENRE_ID_ANIMATION), "剧集"))
+        if "anime" in types:
+            jobs.append(("tv", str(GENRE_ID_ANIMATION), "", "动漫"))
+            jobs.append(("movie", str(GENRE_ID_ANIMATION), "", "动漫电影"))
+        found: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for mtype, with_g, without_g, kind in jobs:
+            try:
+                items = self.__tmdb_discover_http(mtype, date_from, date_to,
+                                                  with_g, without_g)
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】TMDB 发现 {kind} 失败: {e}")
+                continue
+            for it in items:
+                try:
+                    tmdbid = int(it.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                vote = float(it.get("vote_average") or 0)
+                if self._new_sub_min_vote > 0 and vote < self._new_sub_min_vote:
+                    continue
+                if mtype == "tv":
+                    title = it.get("name") or it.get("original_name") or ""
+                    date_s = it.get("first_air_date") or ""
+                else:
+                    title = it.get("title") or it.get("original_title") or ""
+                    date_s = it.get("release_date") or ""
+                if not title:
+                    continue
+                key = f"{mtype}:{tmdbid}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append({
+                    "mtype": mtype, "tmdbid": tmdbid, "title": title,
+                    "year": date_s[:4], "vote": vote, "kind": kind,
+                })
+        found.sort(key=lambda c: c.get("vote", 0), reverse=True)
+        logger.info(f"【{self.plugin_name}】新发布发现：窗口 {date_from}~{date_to}，"
+                    f"候选 {len(found)} 部（类型 {types}，地区 "
+                    f"{'不限' if not self._new_sub_regions else self._new_sub_regions}）")
+        return found
+
+    def __tmdb_discover_http(self, mtype: str, date_from: str, date_to: str,
+                             with_genres: str = "", without_genres: str = ""
+                             ) -> List[Dict[str, Any]]:
+        """
+        直连 TMDB discover API（HTTP）。用 MP 内置 TMDB key 与域名；
+        默认 requests Session（读容器代理环境变量，境外 TMDB 必须走代理）。
+        剧集按 first_air_date、电影按 primary_release_date 做日期窗过滤。
+        """
+        api_key = getattr(settings, "TMDB_API_KEY", "") or ""
+        if not api_key:
+            raise ValueError("TMDB API Key 未配置")
+        host = getattr(settings, "TMDB_API_DOMAIN", None) or "api.themoviedb.org"
+        params: Dict[str, Any] = {
+            "api_key": api_key,
+            "sort_by": "popularity.desc",
+            "include_adult": "false",
+        }
+        if mtype == "tv":
+            params["first_air_date.gte"] = date_from
+            params["first_air_date.lte"] = date_to
+        else:
+            params["primary_release_date.gte"] = date_from
+            params["primary_release_date.lte"] = date_to
+        if with_genres:
+            params["with_genres"] = with_genres
+        if without_genres:
+            params["without_genres"] = without_genres
+        origin = self.__new_sub_origin_param(self._new_sub_regions)
+        if origin:
+            params["with_origin_country"] = origin
+        results: List[Dict[str, Any]] = []
+        for page in range(1, max(1, self._new_sub_pages) + 1):
+            params["page"] = page
+            resp = requests.get(f"https://{host}/3/discover/{mtype}",
+                                params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results.extend([r for r in (data.get("results") or [])
+                            if isinstance(r, dict)])
+            if page >= int(data.get("total_pages") or 1):
+                break
+        return results
+
+    @staticmethod
+    def __new_sub_origin_param(regions: List[str]) -> str:
+        """把 REGION_OPTIONS 的地区 key 翻译成 TMDB with_origin_country 国家码
+        （纯函数可独立测试）；other 无法表达为国家码，忽略；空=不限国家"""
+        codes: List[str] = []
+        for r in regions or []:
+            if r == "cn":
+                codes.append("CN")
+            elif r == "hk":
+                codes.append("HK")
+            elif r == "tw":
+                codes.append("TW")
+            elif r == "jp":
+                codes.append("JP")
+            elif r == "kr":
+                codes.append("KR")
+            elif r == "west":
+                codes.extend(sorted(WEST_COUNTRIES))
+        return "|".join(dict.fromkeys(codes))
+
+    def api_ai_test(self, tmdb_id: int = 0, season: int = 1) -> Dict[str, Any]:
+        """API：AI 辅助判集联调测试（真实调一次 AI，不订阅、不写缓存）"""
+        if not self.__ai_ready():
+            return {"ok": False,
+                    "message": "AI 辅助判集未启用或配置不完整"
+                               "（需要 ai_base_url + ai_api_key + ai_model）"}
+        tmdbid = int(tmdb_id or 0) or 333679
+        season = int(season or 1)
+        title, year = f"TMDB:{tmdbid}", ""
+        try:
+            info = self._mediaChain.recognize_media(mtype=MediaType.TV, tmdbid=tmdbid)
+            if info:
+                title = getattr(info, "title", None) or title
+                year = str(getattr(info, "year", "") or "")
+        except Exception:
+            pass
+        start = time.monotonic()
+        try:
+            res = self.__ai_batch_query([{"tmdbid": tmdbid, "title": title,
+                                          "year": year, "season": season}])
+            return {"ok": True, "tmdbid": tmdbid, "title": title, "season": season,
+                    "answer": res.get((tmdbid, season)),
+                    "elapsed": round(time.monotonic() - start, 2)}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def api_new_sub_test(self, days: int = 0) -> Dict[str, Any]:
+        """API：新发布订阅发现预览（只发现与过滤，不产生任何订阅）"""
+        if not self._new_sub_enabled:
+            return {"ok": False, "message": "新发布订阅未启用（配置页打开开关）"}
+        try:
+            found = self.__new_sub_discover(days=max(0, int(days or 0)))
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+        done = self.get_data(self._DATA_NEWSUB) or {}
+        view = []
+        for cand in found[:20]:
+            key = f"{cand['mtype']}:{cand['tmdbid']}"
+            subscribed = False
+            try:
+                subscribed = bool(
+                    self._subOper.exists(cand["tmdbid"], None)
+                    if cand["mtype"] == "movie"
+                    else self._subOper.exists(cand["tmdbid"], None, season=1))
+            except Exception:
+                pass
+            view.append({
+                "title": cand["title"], "year": cand["year"], "kind": cand["kind"],
+                "tmdbid": cand["tmdbid"], "vote": cand["vote"],
+                "in_ledger": key in done, "already_subscribed": subscribed,
+            })
+        by_kind: Dict[str, int] = {}
+        for cand in found:
+            by_kind[cand["kind"]] = by_kind.get(cand["kind"], 0) + 1
+        return {"ok": True, "total": len(found), "by_kind": by_kind,
+                "sample": view, "dry_run": self._dry_run,
+                "quota_left_today": max(0, self._new_sub_quota - int(
+                    (self.get_data(self._DATA_NEWSUB_DAILY) or {}).get("count", 0)
+                    if (self.get_data(self._DATA_NEWSUB_DAILY) or {}).get("date")
+                    == self.__today_str() else 0))}
 
     # ==================================================================
     # 配置表单 / 详情页
@@ -5943,6 +6808,238 @@ class LackEpisodeAutoSub(_PluginBase):
                             },
                         ]
                     },
+                    # ---- 第十五行：AI 辅助判集（v1.9.11）----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'ai_enabled',
+                                              'label': 'AI 辅助判集',
+                                              'hint': 'TMDB 无分集数据的季，成批问 AI 集数回补缺集',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_model',
+                                              'label': 'AI 模型名',
+                                              'placeholder': 'deepseek-chat',
+                                              'hint': 'OpenAI 兼容模型名',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_batch_size',
+                                              'label': '每批询问季数',
+                                              'type': 'number', 'placeholder': '10',
+                                              'hint': '一次请求问几个季，省 token',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_cache_hours',
+                                              'label': '答案缓存小时',
+                                              'type': 'number', 'placeholder': '72',
+                                              'hint': '缓存期内同一季不重复问',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_base_url',
+                                              'label': 'AI 接口地址',
+                                              'placeholder': 'https://api.deepseek.com/v1',
+                                              'hint': 'OpenAI 兼容接口（/chat/completions 前缀）',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_api_key',
+                                              'label': 'AI API Key',
+                                              'placeholder': 'sk-...',
+                                              'hint': '配好后可 GET /api/v1/plugin/LackEpisodeAutoSub/ai_test 联调',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'ai_no_thinking',
+                                              'label': '关闭 AI 思考模式',
+                                              'hint': 'DeepSeek-V4 等推理模型建议开启：思考会吃光 token 预算导致正文为空；服务不认识该参数时会自动回退',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'ai_max_tokens',
+                                              'label': 'AI 单次 max_tokens',
+                                              'type': 'number', 'placeholder': '16000',
+                                              'hint': '0 = 不下发该参数；推理模型需留足预算',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    # ---- 第十六行：新发布订阅（v1.9.11）----
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {'model': 'new_sub_enabled',
+                                              'label': '新发布订阅',
+                                              'hint': '新上映电影/剧集/动漫自动订阅（独立定时任务）',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'new_sub_cron',
+                                              'label': '发现周期 cron',
+                                              'placeholder': '33 */3 * * *',
+                                              'hint': '默认每 3 小时发现一次',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'new_sub_days',
+                                              'label': '回看窗口（天）',
+                                              'type': 'number', 'placeholder': '3',
+                                              'hint': '上映日期在近 N 天内的才算新发布',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'new_sub_quota',
+                                              'label': '每日上限（部）',
+                                              'type': 'number', 'placeholder': '20',
+                                              'hint': '新发布订阅每日配额（独立于主扫描配额）',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'new_sub_types',
+                                        'label': '订阅类型（多选）',
+                                        'multiple': True,
+                                        'chips': True,
+                                        'items': [
+                                            {'title': '电影', 'value': 'movie'},
+                                            {'title': '剧集', 'value': 'tv'},
+                                            {'title': '动漫', 'value': 'anime'},
+                                        ],
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'new_sub_regions',
+                                        'label': '限定地区（多选，留空=不限国家）',
+                                        'multiple': True,
+                                        'chips': True,
+                                        'items': [
+                                            {'title': name, 'value': key}
+                                            for key, name in REGION_OPTIONS.items()
+                                        ],
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'new_sub_min_vote',
+                                              'label': '最低评分过滤（0=不过滤）',
+                                              'type': 'number', 'placeholder': '0',
+                                              'hint': 'TMDB 评分低于该值的不订（新片评分为 0 属正常，谨慎设置）',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'new_sub_pages',
+                                              'label': '每类拉取页数（1-5）',
+                                              'type': 'number', 'placeholder': '2',
+                                              'hint': '每页 20 条；可 GET /new_sub_test 预览会发现什么',
+                                              'persistent-hint': True}
+                                }]
+                            },
+                        ]
+                    },
                     # ---- 提示 ----
                     {
                         'component': 'VRow',
@@ -6033,6 +7130,27 @@ class LackEpisodeAutoSub(_PluginBase):
             "sa_api_user": "",
             "sa_api_password": "",
             "sa_api_parent_id": "",
+            "pick_prune_enabled": True,
+            "pick_staging_dir": "/CloudNAS/CloudDrive/115open/云下载",
+            "pick_feed_dir": "/CloudNAS/CloudDrive/115open/集合爱影",
+            "pick_trash_dir": "/CloudNAS/CloudDrive/115open/补集待清理",
+            "pick_stable_min": 10,
+            "ai_enabled": False,
+            "ai_base_url": "",
+            "ai_api_key": "",
+            "ai_model": "",
+            "ai_batch_size": 10,
+            "ai_cache_hours": 72,
+            "ai_no_thinking": True,
+            "ai_max_tokens": 16000,
+            "new_sub_enabled": False,
+            "new_sub_cron": "33 */3 * * *",
+            "new_sub_types": ["movie", "tv", "anime"],
+            "new_sub_days": 3,
+            "new_sub_min_vote": 0,
+            "new_sub_quota": 20,
+            "new_sub_regions": [],
+            "new_sub_pages": 2,
         }
 
     def get_page(self) -> List[dict]:
@@ -6050,7 +7168,7 @@ class LackEpisodeAutoSub(_PluginBase):
         # 完整明细同步写在「备注」列与日志里）
         _CHANNEL_LABEL = {"pt": "🔵 PT", "aiying_api": "🟢 115·API",
                           "aiying_tg": "🟢 115·TG", "aiying": "🟢 115·TG",
-                          "mixed": "🟠 混合"}
+                          "mixed": "🟠 混合", "new_sub": "🆕 新发"}
         recent_view: List[dict] = []
         for _h in recent:
             _row = dict(_h)
