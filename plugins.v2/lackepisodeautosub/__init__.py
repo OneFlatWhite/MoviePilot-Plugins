@@ -802,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.13"
+    plugin_version = "1.9.14"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -968,6 +968,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _DATA_DAILY = "daily"                # 当日配额计数 {"date": "YYYY-MM-DD", "count": n}
     _DATA_STATS = "stats"                # 累计统计
     _DATA_PENDING = "pending_verify"     # 已订阅未核销的剧 {tmdbid: 快照}
+    _DATA_REFILL_MIG = "refill_migrated_v1914"  # v1.9.14 一次性迁移标记：存量超时剧解锁重补
     _DATA_DEAD = "dead_tasks"            # 最近一轮疑似死任务快照（详情页展示用）
     _DATA_PROGRESS = "progress"          # 本轮实时进度快照（详情页进度条 / API 轮询用）
     _DATA_TG_LOGIN = "tg_login"          # TG 登录状态缓存 {logged_in, username, phone, ...}
@@ -1024,6 +1025,31 @@ class LackEpisodeAutoSub(_PluginBase):
                 self._clear_history = False
                 logger.info(f"【{self.plugin_name}】历史记录、已处理清单与完结账本已清空")
                 self.__update_config()
+
+            # v1.9.14 一次性迁移：把「已超时告警」的剧从已处理清单解锁——
+            # 修复 bug：订阅成功即写入 processed，扫描过滤器从此永远跳过该剧，
+            # 超时后爱影通道再也不会被重试（哪怕资源明明有），679 部永久卡死。
+            # 迁移后下轮扫描重新候选：爱影有资源就补，没有才落 PT；
+            # 补齐/重订阅成功会重写 processed 并重置验证快照，形成 alert_days 一轮的重试节奏
+            if not self.get_data(self._DATA_REFILL_MIG):
+                try:
+                    _mig_pending = self.get_data(self._DATA_PENDING) or {}
+                    _mig_ids = {str(v.get("tmdbid") or "")
+                                for v in _mig_pending.values() if v.get("alerted")}
+                    _mig_ids.discard("")
+                    if _mig_ids:
+                        _mig_processed = self.get_data(self._DATA_PROCESSED) or {}
+                        _mig_hit = _mig_ids & set(_mig_processed.keys())
+                        for _k in _mig_hit:
+                            _mig_processed.pop(_k, None)
+                        if _mig_hit:
+                            self.save_data(self._DATA_PROCESSED, _mig_processed)
+                        logger.info(f"【{self.plugin_name}】v1.9.14 迁移：{len(_mig_hit)}/"
+                                    f"{len(_mig_ids)} 部超时剧已从已处理清单解锁，"
+                                    f"下轮扫描重新尝试补齐")
+                    self.save_data(self._DATA_REFILL_MIG, {"done": True})
+                except Exception as e:
+                    logger.error(f"【{self.plugin_name}】v1.9.14 迁移失败（下轮重试）: {e}")
 
             # 处理「AY115通道」TG 登录一次性开关（发验证码/完成登录）
             if self._tg_send_code_once or self._tg_verify_once:
@@ -3159,7 +3185,7 @@ class LackEpisodeAutoSub(_PluginBase):
                     history, title=title, year=str(entry.get("year", "")),
                     tmdbid=int(entry.get("tmdbid") or 0), lack_info={},
                     missing_count=remaining_count, result="超时未补齐",
-                    message=f"订阅 {wait_days} 天未入库，请人工检查资源",
+                    message=f"订阅 {wait_days} 天未入库，已解锁下轮重试爱影补齐",
                     channel=entry.get("channel", ""))
                 # v1.5.0：超时闭环动作——订阅还在则自动重置（默认开），
                 # 订阅丢失则按配置决定是否补订（默认关），仅在首次告警这一轮执行一次
@@ -3167,6 +3193,21 @@ class LackEpisodeAutoSub(_PluginBase):
                     self.__handle_timeout_subscription(entry, title, history)
                 except Exception as e:
                     logger.error(f"【{title}】超时订阅闭环处理失败（不影响告警）: {e}")
+                # v1.9.14：超时闭环时把剧从「已处理」清单移除——否则扫描过滤器
+                # 从此永远跳过它，爱影通道再也不会被重试（哪怕资源明明有）。
+                # 移除后下一轮扫描重新评估：爱影有资源就补，没有才落 PT；
+                # 订阅成功会重写 processed 并重置验证快照（alerted 归零），
+                # 形成「每 alert_days 一轮」的自动重试节奏，直到补齐核销为止
+                try:
+                    _refill_processed = self.get_data(self._DATA_PROCESSED) or {}
+                    _refill_key = str(entry.get("tmdbid") or "")
+                    if _refill_key and _refill_key in _refill_processed:
+                        _refill_processed.pop(_refill_key, None)
+                        self.save_data(self._DATA_PROCESSED, _refill_processed)
+                        logger.info(f"【{title}】超时未补齐，已解锁重补："
+                                    f"下轮扫描将重新尝试爱影通道")
+                except Exception as e:
+                    logger.error(f"【{title}】解锁重补失败（不影响告警）: {e}")
             else:
                 # waiting 或已告警过的 timeout：更新剩余缺集，继续等
                 if new_remaining != entry.get("remaining"):
@@ -3205,7 +3246,8 @@ class LackEpisodeAutoSub(_PluginBase):
                     mtype=NotificationType.SiteMessage,
                     title=f"【{self.plugin_name}】订阅超时未入库 ⚠️",
                     text=(f"以下剧集订阅超过 {self._verify_alert_days} 天仍未补齐，"
-                          f"可能全网无资源或死种，请人工检查：\n{text}"),
+                          f"已自动解锁：下轮扫描将重新尝试爱影补齐"
+                          f"（每 {self._verify_alert_days} 天一轮，直到补齐）：\n{text}"),
                 )
             except Exception as e:
                 logger.error(f"【{self.plugin_name}】发送超时告警失败: {e}")
