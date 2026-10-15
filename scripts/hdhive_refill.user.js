@@ -256,51 +256,49 @@
     return true;
   }
 
-  async function findAndUnlock(t) {
-    // v2.0 全实测链路（KimiCU 接管用户浏览器逐页验证）：
-    // 1) /search?tab=media&query=<tmdbid>&type=tv_tmdb_id   （参数名 query 实测）
-    // 2) 点结果卡进详情 /tv/<uuid>
-    // 3) 详情页 a[href*="/resource/115/"] → 资源页
-    // 4) 资源页 HTML（decodeURIComponent 后）里直接含 115 分享链接
-    //    （确认解锁按钮 href = 115.com/?goto=<urlencoded 分享链接>），无需点击
-    navTo('/search?tab=media&query=' + t.tmdbid + '&type=tv_tmdb_id');
-    await sleep(SEARCH_WAIT_MS + 1500);
-    // 打开结果卡：优先按剧名文本匹配，否则第一张结果卡
-    let card = [...document.querySelectorAll('a')].find(a =>
-      (a.textContent || '').includes(t.title));
-    if (!card) card = document.querySelector('a[href^="/tv/"], a[href^="/movie/"]');
-    if (!card) { log(`❌ ${t.title} 搜索无结果卡`); return []; }
-    card.click();
-    await sleep(SEARCH_WAIT_MS + 1500);
-    // 详情页 → 资源入口
-    let res = null;
-    for (let i = 0; i < 4; i++) {
-      res = document.querySelector('a[href*="/resource/115/"]');
-      if (res) break;
-      window.scrollBy(0, 1500);
-      await sleep(1200);
-    }
-    if (!res) { log(`❌ ${t.title} 详情页没找到 115 资源入口`); return []; }
-    const resPath = res.getAttribute('href');
-    log(`📎 ${t.title} 找到 115 资源页，读取分享链接…`);
-    navTo(resPath.startsWith('http') ? resPath : (resPath.startsWith('/') ? resPath : '/' + resPath));
-    await sleep(SEARCH_WAIT_MS + 1500);
-    // 资源页 HTML 解码后抓 115 分享链接（确认解锁按钮 href 里就带着）
-    let links = [];
-    for (let i = 0; i < SEARCH_RETRY; i++) {
-      try {
-        const html = decodeURIComponent(document.documentElement.innerHTML);
-        const rx = /https?:\/\/(?:www\.)?(?:115|115cdn)\.com\/s\/[0-9A-Za-z]+(?:\?password=[0-9A-Za-z]+)?/g;
-        const set = new Set();
-        let m;
-        while ((m = rx.exec(html)) !== null && set.size < MAX_LINKS_PER_TASK) set.add(m[0]);
-        links = [...set];
-        if (links.length) break;
-      } catch (e) {}
-      await sleep(SEARCH_WAIT_MS);
-    }
-    if (!links.length) log(`❌ ${t.title} 资源页未抓到 115 链接`);
-    return links;
+  // ---------- 状态机（整页导航驱动，v2.2.0）----------
+  // 不再模拟点击：每一步从 DOM 读取目标 href，直接 location.href 导航；
+  // 任务状态经 GM 持久化，跨页面由 onPageLoad 接力。
+  function saveCur(c) { GM_setValue('cur', c); }
+  function getCur() { return GM_getValue('cur', null); }
+  function clearCur() { GM_setValue('cur', null); }
+
+  function harvest115decoded() {
+    let html = document.documentElement.innerHTML || '';
+    try { html = decodeURIComponent(html); } catch (e) {}
+    html = html.replace(/\\/g, '/').replace(/\u002F/gi, '/');
+    const rx = /https?:\/\/(?:www\.)?(?:115|115cdn)\.com\/s\/[0-9A-Za-z]+(?:\?password=[0-9A-Za-z]+)?/g;
+    const set = new Set();
+    let m;
+    while ((m = rx.exec(html)) !== null && set.size < MAX_LINKS_PER_TASK) set.add(m[0]);
+    return [...set];
+  }
+
+  function failTask(cur, why) {
+    addFail({ tmdbid: cur.tmdbid });
+    log(`❌ ${cur.title} ${why}`);
+    clearCur();
+    if (autoRunning) setTimeout(pump, 4000);
+  }
+
+  function startTask(t) {
+    saveCur({ tmdbid: t.tmdbid, title: t.title, year: t.year || '',
+              missing: t.missing, stage: 'search', steps: 0 });
+    log(`🔍 ${t.title}（缺 ${t.missing} 集）开始…`);
+    location.href = '/search?tab=media&query=' + t.tmdbid + '&type=tv_tmdb_id';
+  }
+
+  function nextTask() {
+    return queue.filter(t => !isDone(t) && failCnt(t) < 2)[0] || null;
+  }
+
+  function pump() {
+    if (!autoRunning || busy) return;
+    if (getCur()) return;
+    const t = nextTask();
+    if (!t) { log('队列暂无可处理任务，等 MP 下轮'); return; }
+    busy = true;
+    startTask(t);
   }
 
   function submitLinks(t, links, source) {
@@ -319,36 +317,79 @@
     return true;
   }
 
-  async function processTask(t) {
-    if (isDone(t)) { log(`⏭ ${t.title} 今天已处理过`); return; }
-    if (failCnt(t) >= 2) { log(`⏭ ${t.title} 连续失败≥2 次，今天不再试`); return; }
-    log(`🔍 ${t.title}（缺 ${t.missing} 集）站内搜索…`);
-    const kw = t.year ? `${t.title} ${t.year}` : t.title;
-    const links = await findAndUnlock(t);
-    if (!links.length) {
-      addFail(t);
-      log(`❌ ${t.title} 没抓到 115 链接`);
-      return;
-    }
-    await submitLinks(t, links, 're0_auto');
-  }
-
-  async function runAuto() {
-    if (busy) return;
+  // 每个新页面加载后由 main() 调用一次：按 stage 接力
+  async function onPageLoad() {
+    const cur = getCur();
+    if (!cur) return;
+    const url = location.pathname + location.search;
     busy = true;
     try {
-      await refreshQueue();
-      const pending = queue.filter(t => !isDone(t) && failCnt(t) < 2);
-      log(`队列 ${queue.length} 部，待处理 ${pending.length} 部`);
-      for (const t of pending) {
-        if (!autoRunning) { log('已停止'); break; }
-        await processTask(t);
-        await sleep(TASK_GAP_MS);
+      // ---- 搜索结果页：找结果卡 href → 进详情 ----
+      if (cur.stage === 'search' && url.includes('query=' + cur.tmdbid)) {
+        await sleep(2800);
+        let card = document.querySelector('a[href^="/tv/"]')
+          || [...document.querySelectorAll('a')].find(a => (a.textContent || '').includes(cur.title));
+        if (!card || !card.getAttribute('href')) throw new Error('搜索无结果卡');
+        const href = card.getAttribute('href');
+        saveCur({ ...cur, stage: 'detail', steps: cur.steps + 1 });
+        location.href = href.startsWith('http') ? href : location.origin + href;
+        return;
+      }
+      // ---- 详情页：滚动等网盘区 → 资源入口 href → 进资源页 ----
+      if (cur.stage === 'detail' && location.pathname.startsWith('/tv/')) {
+        let res = null;
+        for (let i = 0; i < 8; i++) {
+          res = document.querySelector('a[href*="/resource/115/"]');
+          if (res) break;
+          window.scrollBy(0, 1400);
+          await sleep(1500);
+        }
+        if (!res) throw new Error('详情页没找到 115 资源入口');
+        const href = res.getAttribute('href');
+        log(`📎 ${cur.title} 找到 115 资源页…`);
+        saveCur({ ...cur, stage: 'resource', steps: cur.steps + 1 });
+        location.href = href.startsWith('http') ? href : location.origin + href;
+        return;
+      }
+      // ---- 资源页：解码 HTML 抓 115 链接（解锁按钮 href 自带链接；不够再点解锁）----
+      if (cur.stage === 'resource' && url.includes('/resource/115/')) {
+        let links = [];
+        for (let i = 0; i < 3; i++) {
+          links = harvest115decoded();
+          if (links.length) break;
+          await sleep(2000);
+        }
+        if (!links.length) {
+          const m = (document.body.textContent || '').match(/需要使用\s*(\d+)\s*积分/);
+          const btn = [...document.querySelectorAll('button')]
+            .find(b => (b.textContent || '').includes('解锁'));
+          if (btn && (!m || parseInt(m[1], 10) === 0)) {
+            log('🔓 0 积分资源，点确认解锁…');
+            btn.click();
+            await sleep(3500);
+            links = harvest115decoded();
+          }
+        }
+        if (!links.length) throw new Error('资源页没抓到 115 链接');
+        submitLinks(cur, links.slice(0, MAX_LINKS_PER_TASK), 're0_auto');
+        clearCur();
+        busy = false;
+        if (autoRunning) setTimeout(pump, TASK_GAP_MS);
+        return;
+      }
+      // ---- 页面与任务阶段不匹配（被打断）→ 回搜索页重来 ----
+      if (cur.steps < 8) {
+        saveCur({ ...cur, stage: 'search', steps: cur.steps + 1 });
+        location.href = '/search?tab=media&query=' + cur.tmdbid + '&type=tv_tmdb_id';
+      } else {
+        failTask(cur, '步骤超限');
       }
     } catch (e) {
-      log('自动模式出错：' + e.message);
+      failTask(cur, e.message);
     } finally { busy = false; }
   }
+
+  function runAuto() { pump(); }
 
   // ---------- 面板 ----------
   function taskListHtml() {
@@ -452,7 +493,7 @@
       const one = ev.target.getAttribute && ev.target.getAttribute('data-one');
       if (one) {
         const t = queue.find(x => String(x.tmdbid) === one);
-        if (t && !busy) { busy = true; await processTask(t); busy = false; }
+        if (t && !busy) startTask(t);
       }
       const kw = ev.target.getAttribute && ev.target.getAttribute('data-search');
       if (kw) {
@@ -491,14 +532,14 @@
 
   function main() {
     buildPanel();
-    refreshQueue().then(q => log(`已连接 MP，当前缺集队列 ${q.length} 部`))
+    refreshQueue().then(q => { log(`已连接 MP，当前缺集队列 ${q.length} 部`); onPageLoad(); })
       .catch(e => log('MP 连接失败：' + e.message));
     setInterval(() => {
-      refreshQueue().catch(e => log('轮询失败：' + e.message));
+      refreshQueue().then(q2 => { updateBadge(); if (autoRunning && !busy) onPageLoad(); }).catch(() => {});
       maybeBanner();
-      if (autoRunning && !busy) runAuto();
+      if (autoRunning && !busy) pump();
     }, POLL_SEC * 1000);
-    if (autoRunning) runAuto();
+    if (autoRunning) pump();
   }
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') main();
