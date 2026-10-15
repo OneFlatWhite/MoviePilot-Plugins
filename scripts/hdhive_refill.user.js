@@ -283,6 +283,20 @@
     return [...set];
   }
 
+  // MutationObserver 等待元素出现——渲染多慢都能等到（v2.4.1）
+  function waitForEl(getEl, timeoutMs) {
+    return new Promise(resolve => {
+      const got = getEl();
+      if (got) { resolve(got); return; }
+      const obs = new MutationObserver(() => {
+        const el = getEl();
+        if (el) { obs.disconnect(); resolve(el); }
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); resolve(null); }, timeoutMs);
+    });
+  }
+
   function failTask(cur, why) {
     addFail({ tmdbid: cur.tmdbid });
     log(`❌ ${cur.title} ${why}`);
@@ -335,13 +349,14 @@
     try {
       // ---- 搜索结果页：找结果卡 href → 进详情 ----
       if (cur.stage === 'search' && url.includes('query=' + cur.tmdbid)) {
-        let card = null;
-        for (let i = 0; i < 10; i++) {
-          card = document.querySelector('a[href*="/tv/"]')
+        const findCard = () => {
+          const c = document.querySelector('a[href*="/tv/"]')
             || [...document.querySelectorAll('a')].find(a => (a.textContent || '').includes(cur.title));
-          if (card && card.getAttribute('href')) break;
-          if ((document.body.textContent || '').includes('没有搜索到相关内容')) break;
-          await sleep(1500);
+          return (c && c.getAttribute('href')) ? c : null;
+        };
+        let card = await waitForEl(findCard, 40000);
+        if (!card && !(document.body.textContent || '').includes('没有搜索到相关内容')) {
+          card = await waitForEl(findCard, 15000);
         }
         if (!card || !card.getAttribute('href')) throw new Error('搜索无结果卡');
         const href = card.getAttribute('href');
@@ -351,12 +366,12 @@
       }
       // ---- 详情页：滚动等网盘区 → 资源入口 href → 进资源页 ----
       if (cur.stage === 'detail' && location.pathname.startsWith('/tv/')) {
-        let res = null;
-        for (let i = 0; i < 8; i++) {
-          res = document.querySelector('a[href*="/resource/115/"]');
-          if (res) break;
-          window.scrollBy(0, 1400);
-          await sleep(1500);
+        let res = await waitForEl(
+          () => document.querySelector('a[href*="/resource/115/"]'), 30000);
+        if (!res) {
+          window.scrollBy(0, 1200);
+          res = await waitForEl(
+            () => document.querySelector('a[href*="/resource/115/"]'), 15000);
         }
         if (!res) throw new Error('详情页没找到 115 资源入口');
         const href = res.getAttribute('href');
@@ -368,10 +383,10 @@
       // ---- 资源页：解码 HTML 抓 115 链接（解锁按钮 href 自带链接；不够再点解锁）----
       if (cur.stage === 'resource' && url.includes('/resource/115/')) {
         let links = [];
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 6; i++) {
           links = harvest115decoded();
           if (links.length) break;
-          await sleep(2000);
+          await sleep(2500);
         }
         if (!links.length) {
           const m = (document.body.textContent || '').match(/需要使用\s*(\d+)\s*积分/);
