@@ -337,7 +337,7 @@
       if (cur.stage === 'search' && url.includes('query=' + cur.tmdbid)) {
         let card = null;
         for (let i = 0; i < 10; i++) {
-          card = document.querySelector('a[href^="/tv/"]')
+          card = document.querySelector('a[href*="/tv/"]')
             || [...document.querySelectorAll('a')].find(a => (a.textContent || '').includes(cur.title));
           if (card && card.getAttribute('href')) break;
           if ((document.body.textContent || '').includes('没有搜索到相关内容')) break;
