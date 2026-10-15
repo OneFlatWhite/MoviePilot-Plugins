@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RE0影巢缺集回填助手（re0.me → MoviePilot 缺集自动补齐）
 // @namespace    https://github.com/OneFlatWhite/MoviePilot-Plugins
-// @version      1.5.0
+// @version      2.0.0
 // @description  自动拉取 MoviePilot 缺集队列，在 RE0影巢(re0.me) 站内搜索剧名，抓取 115 分享链接回填给 MP 插件转存补齐。支持全自动巡队 / 单剧手动找 / 本页链接回填（可选剧）。
 // @author       OneFlatWhite
 // @match        *://re0.me/*
@@ -257,55 +257,50 @@
   }
 
   async function findAndUnlock(t) {
-    // 线性直达流程（用户实测链路）：
-    // 搜索(q=tmdbid) → 打开详情 → 网盘区找 /resource/115/ 入口 →
-    // 解锁页确认解锁（0 积分才点，防烧积分）→ 解锁后抓 115 链接
-    navTo('/search?tab=media&type=tv_tmdb_id&q=' + t.tmdbid);
-    await sleep(SEARCH_WAIT_MS + 1200);
-    // 打开详情：点含 tmdbid 的结果卡；没有就试第一个结果卡
-    let card = document.querySelector(`a[href*="${t.tmdbid}"]`);
-    if (!card) {
-      card = [...document.querySelectorAll('a,img,div')]
-        .find(e => (e.textContent || '').includes(t.title) && e.closest('a'));
-    }
-    if (card) { card.click(); await sleep(SEARCH_WAIT_MS); }
-    // 详情页网盘区：等 /resource/115/ 入口出现（可能需要向下滚动触发懒加载）
-    let resLinks = [];
+    // v2.0 全实测链路（KimiCU 接管用户浏览器逐页验证）：
+    // 1) /search?tab=media&query=<tmdbid>&type=tv_tmdb_id   （参数名 query 实测）
+    // 2) 点结果卡进详情 /tv/<uuid>
+    // 3) 详情页 a[href*="/resource/115/"] → 资源页
+    // 4) 资源页 HTML（decodeURIComponent 后）里直接含 115 分享链接
+    //    （确认解锁按钮 href = 115.com/?goto=<urlencoded 分享链接>），无需点击
+    navTo('/search?tab=media&query=' + t.tmdbid + '&type=tv_tmdb_id');
+    await sleep(SEARCH_WAIT_MS + 1500);
+    // 打开结果卡：优先按剧名文本匹配，否则第一张结果卡
+    let card = [...document.querySelectorAll('a')].find(a =>
+      (a.textContent || '').includes(t.title));
+    if (!card) card = document.querySelector('a[href^="/tv/"], a[href^="/movie/"]');
+    if (!card) { log(`❌ ${t.title} 搜索无结果卡`); return []; }
+    card.click();
+    await sleep(SEARCH_WAIT_MS + 1500);
+    // 详情页 → 资源入口
+    let res = null;
     for (let i = 0; i < 4; i++) {
-      resLinks = [...document.querySelectorAll('a[href*="/resource/115/"]')];
-      if (resLinks.length) break;
+      res = document.querySelector('a[href*="/resource/115/"]');
+      if (res) break;
       window.scrollBy(0, 1500);
-      await sleep(1500);
+      await sleep(1200);
     }
-    if (!resLinks.length) { log(`❌ ${t.title} 详情页没找到 115 资源入口`); return []; }
-    log(`📎 ${t.title} 发现 ${resLinks.length} 个 115 资源，逐个解锁查看…`);
-    const found = [];
-    for (const rl of resLinks.slice(0, 2)) {
-      try { rl.click(); } catch (e) { continue; }
-      await sleep(SEARCH_WAIT_MS + 1500);
-      if (!/\/resource\//.test(location.href)) {
-        // SPA 可能没跳 URL：只要页面出现解锁按钮也算到位
-        if (!([...document.querySelectorAll('button')]
-            .some(b => (b.textContent || '').includes('解锁')))) continue;
-      }
-      // 积分护栏：解锁要花积分（>0）的资源直接跳过，绝不自动点击
-      const m = (document.body.textContent || '').match(/需要使用\s*(\d+)\s*积分/);
-      if (m && parseInt(m[1], 10) > 0) {
-        log(`⏭ 资源需要 ${m[1]} 积分解锁，跳过（不自动消耗）`);
-        history.back(); await sleep(1800); continue;
-      }
-      const unlockBtn = [...document.querySelectorAll('button')]
-        .find(b => (b.textContent || '').includes('解锁'));
-      if (unlockBtn) {
-        unlockBtn.click();
-        log('🔓 已点确认解锁，等待链接生成…');
-        await sleep(2500);
-      }
-      const links = await harvestWithRetry();
-      if (links.length) { found.push(...links); break; }
-      history.back(); await sleep(2000);
+    if (!res) { log(`❌ ${t.title} 详情页没找到 115 资源入口`); return []; }
+    const resPath = res.getAttribute('href');
+    log(`📎 ${t.title} 找到 115 资源页，读取分享链接…`);
+    navTo(resPath.startsWith('http') ? resPath : (resPath.startsWith('/') ? resPath : '/' + resPath));
+    await sleep(SEARCH_WAIT_MS + 1500);
+    // 资源页 HTML 解码后抓 115 分享链接（确认解锁按钮 href 里就带着）
+    let links = [];
+    for (let i = 0; i < SEARCH_RETRY; i++) {
+      try {
+        const html = decodeURIComponent(document.documentElement.innerHTML);
+        const rx = /https?:\/\/(?:www\.)?(?:115|115cdn)\.com\/s\/[0-9A-Za-z]+(?:\?password=[0-9A-Za-z]+)?/g;
+        const set = new Set();
+        let m;
+        while ((m = rx.exec(html)) !== null && set.size < MAX_LINKS_PER_TASK) set.add(m[0]);
+        links = [...set];
+        if (links.length) break;
+      } catch (e) {}
+      await sleep(SEARCH_WAIT_MS);
     }
-    return found.slice(0, MAX_LINKS_PER_TASK);
+    if (!links.length) log(`❌ ${t.title} 资源页未抓到 115 链接`);
+    return links;
   }
 
   async function submitLinks(t, links, source) {
