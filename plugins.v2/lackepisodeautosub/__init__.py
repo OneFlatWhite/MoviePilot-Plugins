@@ -802,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.14"
+    plugin_version = "1.9.15"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -904,6 +904,7 @@ class LackEpisodeAutoSub(_PluginBase):
     _aiying_api_url: str = ""            # AY API 地址
     _aiying_api_token: str = ""          # API token（用户自己的）
     _aiying_api_max_links: int = 3       # 单剧最多提交分享链接数
+    _aiying_round_clicks: int = 100      # 单轮 AY 点击熔断上限（v1.9.15 可配，一次性大补可调高）
     _tg_id: str = ""                     # TG 用户 ID（API 需要；留空则从 TG 会话自动获取并缓存）
     _ay_api_probe_once: bool = False     # 一次性开关：保存配置时测试 AY API 连通性
     _ay_http_session = None              # AY API 专用直连 Session（v1.9.7，惰性创建）
@@ -1214,6 +1215,9 @@ class LackEpisodeAutoSub(_PluginBase):
         self._aiying_api_token = str(config.get("aiying_api_token") or "").strip()
         self._aiying_api_max_links = max(
             1, self.__to_int(config.get("aiying_api_max_links"), 3))
+        # v1.9.15：单轮 AY 点击熔断可配置（一次性大补可临时调高，如 800）
+        self._aiying_round_clicks = max(
+            20, self.__to_int(config.get("aiying_round_clicks"), 100))
         self._tg_id = str(config.get("tg_id") or "").strip()
         self._ay_api_probe_once = bool(config.get("ay_api_probe_once", False))
 
@@ -1389,6 +1393,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "aiying_api_url": self._aiying_api_url,
             "aiying_api_token": self._aiying_api_token,
             "aiying_api_max_links": self._aiying_api_max_links,
+            "aiying_round_clicks": self._aiying_round_clicks,
             "tg_id": self._tg_id,
             "ay_api_probe_once": self._ay_api_probe_once,
             "sa_http_enabled": self._sa_http_enabled,
@@ -2467,24 +2472,27 @@ class LackEpisodeAutoSub(_PluginBase):
             sid_map: Dict[int, int] = {}   # 成功季 -> sid（渠道明细用，v1.7.0）
             ay = None
             if aiying_usable:
-                # 【风控】单轮AY总点击数熔断：超过 100 次本轮停止使用AY，剩余走 PT
+                # 【风控】单轮AY总点击数熔断：超过配置上限（v1.9.15 可配，
+                # 默认 100）本轮停止使用AY，剩余走 PT
                 # （v1.7.0：API 查询与 SA 提交也计入该计数）
-                if aiying_clicks >= 100:
+                if aiying_clicks >= self._aiying_round_clicks:
                     if not aiying_fuse_logged:
                         aiying_fuse_logged = True
-                        logger.warning(f"【{self.plugin_name}】AY本轮点击已达 100 次上限，"
+                        logger.warning(f"【{self.plugin_name}】AY本轮点击已达 "
+                                       f"{self._aiying_round_clicks} 次上限，"
                                        f"触发熔断，剩余候选全部转 PT 订阅")
                         self.__append_history(
                             history, title="（系统）", year="", tmdbid=0, lack_info={},
                             missing_count=0, result="AY熔断",
-                            message="本轮AY点击超过 100 次，剩余候选转 PT")
+                            message=f"本轮AY点击超过 {self._aiying_round_clicks} 次，剩余候选转 PT")
                 else:
                     # v1.7.0：先 HTTP API 后 TG——
                     # API 返回 None（请求异常/tg_id 不可得）才回退 TG 点按钮流程；
                     # API 明确「无资源」（status=none）时不再走 TG，直接转 PT
                     if self._aiying_api_enabled and ay_api_precheck_ok:
                         try:
-                            ay = self.__aiying_api_fill(cand, 100 - aiying_clicks)
+                            ay = self.__aiying_api_fill(
+                                cand, self._aiying_round_clicks - aiying_clicks)
                             if ay:
                                 aiying_clicks += ay.get("clicks", 0)
                         except Exception as e:
@@ -2492,7 +2500,8 @@ class LackEpisodeAutoSub(_PluginBase):
                             ay = None
                     if ay is None:
                         try:
-                            ay = self.__aiying_fill(cand, 100 - aiying_clicks)
+                            ay = self.__aiying_fill(
+                                cand, self._aiying_round_clicks - aiying_clicks)
                             if ay:
                                 aiying_clicks += ay.get("clicks", 0)
                         except Exception as e:
@@ -6495,6 +6504,18 @@ class LackEpisodeAutoSub(_PluginBase):
                                               'persistent-hint': False}
                                 }]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {'model': 'aiying_round_clicks',
+                                              'label': '单轮 AY 点击上限',
+                                              'type': 'number', 'placeholder': '100',
+                                              'hint': '每轮扫描最多查询爱影的部数（熔断）；一次性大补可临时调到 800',
+                                              'persistent-hint': True}
+                                }]
+                            },
                         ]
                     },
                     # ---- 第十一行又半：API token 与 tg_id ----
@@ -7159,6 +7180,7 @@ class LackEpisodeAutoSub(_PluginBase):
             "aiying_api_url": "",
             "aiying_api_token": "",
             "aiying_api_max_links": 3,
+            "aiying_round_clicks": 100,
             "tg_id": "",
             "ay_api_probe_once": False,
             "sa_http_enabled": True,
