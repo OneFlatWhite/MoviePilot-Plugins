@@ -802,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.15"
+    plugin_version = "1.9.16"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -1601,6 +1601,25 @@ class LackEpisodeAutoSub(_PluginBase):
                 "summary": "新发布订阅发现预览",
                 "description": "参数 days（可选，覆盖回看窗口）。只做 TMDB 发现与过滤预览，"
                                "不产生任何订阅；返回各类型候选数与前 20 条明细（含已订阅/已入库标记）",
+            },
+            {
+                "path": "/refill_queue",
+                "endpoint": self.api_refill_queue,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "待找资源队列（油猴补齐桥）",
+                "description": "返回补齐验证清单中仍有剩余缺集的剧（剧名/年份/tmdbid/各季缺集/"
+                               "已等天数），按等待时间降序，最多 200 条；影巢油猴脚本定时拉取",
+            },
+            {
+                "path": "/refill_submit",
+                "endpoint": self.api_refill_submit,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "回填 115 分享链接（油猴补齐桥）",
+                "description": "body 传 {\"tmdbid\", \"title\", \"links\": \"115分享链接（每行一条，"
+                               "可带#访问码）\", \"source\": \"hdhive\"(可选)}；按链接类型分流提交 "
+                               "SA（磁力→离线，115 分享→消息通道转存），成功后刷新入库验证快照",
             },
         ]
 
@@ -5962,6 +5981,98 @@ class LackEpisodeAutoSub(_PluginBase):
                     (self.get_data(self._DATA_NEWSUB_DAILY) or {}).get("count", 0)
                     if (self.get_data(self._DATA_NEWSUB_DAILY) or {}).get("date")
                     == self.__today_str() else 0))}
+
+    # ==================================================================
+    # 油猴/人工补齐桥（v1.9.16）：服务端出「缺什么」队列，浏览器端
+    # （影巢 HDHive 油猴脚本）拉队列→站内搜索→抓 115 分享→回填本插件
+    # ==================================================================
+    def api_refill_queue(self) -> Dict[str, Any]:
+        """API 端点：待找资源队列。取补齐验证清单中仍有剩余缺集的剧，
+        按已等天数降序（最久缺的排最前），最多 200 条。油猴脚本定时拉取。"""
+        try:
+            pending = self.get_data(self._DATA_PENDING) or {}
+            now = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+            items: List[Dict[str, Any]] = []
+            for entry in pending.values():
+                remaining = entry.get("remaining") or {}
+                seasons = {str(s): list(eps) for s, eps in remaining.items() if eps}
+                if not seasons:
+                    continue
+                wait_days = 0
+                try:
+                    st = datetime.datetime.strptime(
+                        entry.get("subscribe_time") or "", TIME_FMT).replace(
+                        tzinfo=pytz.timezone(settings.TZ))
+                    wait_days = max(0, (now - st).days)
+                except Exception:
+                    pass
+                items.append({
+                    "tmdbid": int(entry.get("tmdbid") or 0),
+                    "title": entry.get("title", ""),
+                    "year": str(entry.get("year", "")),
+                    "seasons": seasons,
+                    "missing": sum(len(v) for v in seasons.values()),
+                    "wait_days": wait_days,
+                })
+            items.sort(key=lambda x: (-x.get("wait_days", 0), -x.get("missing", 0)))
+            return {"success": True, "message": "",
+                    "data": {"count": len(items), "items": items[:200]}}
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】refill_queue 异常: {e}")
+            return {"success": False, "message": str(e),
+                    "data": {"count": 0, "items": []}}
+
+    def api_refill_submit(self, tmdbid: int = 0, title: str = _BODY_STR,
+                          links: str = _BODY_STR,
+                          source: str = _BODY_STR) -> Dict[str, Any]:
+        """
+        API 端点：油猴/人工回填 115 分享链接 → 提交 SA 转存。
+        body（JSON）: {"tmdbid": 123, "title": "剧名", "links": "https://115.com/s/xx#pwd\\n...",
+        "source": "hdhive"(可选，仅记录)}
+        复用 __sa_submit 按链接类型分流（磁力/ed2k → API 离线；115 分享 → 企微/TG 消息通道）。
+        提交成功后刷新该剧的入库验证快照（等待 SA 归档后由验证回环核销）。
+        """
+        try:
+            _tmdbid = int(tmdbid or 0)
+        except (TypeError, ValueError):
+            _tmdbid = 0
+        raw = (links or "") if isinstance(links, str) else "\n".join(
+            str(x) for x in (links or []))
+        urls: List[str] = []
+        seen: Set[str] = set()
+        for line in re.split(r"[\r\n]+", raw or ""):
+            u = line.strip()
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+        if not urls:
+            return {"success": False, "message": "links 为空（每行一条 115 分享链接）"}
+        if not _tmdbid:
+            return {"success": False, "message": "tmdbid 为空"}
+        _title = (title or "").strip() or f"tmdb-{_tmdbid}"
+        logger.info(f"【{_title}】收到油猴回填 {len(urls)} 条链接"
+                    f"（source={source or 'hdhive'}），提交 SA")
+        r = self.__sa_submit([(f"ep{i + 1}", u) for i, u in enumerate(urls)],
+                             _title)
+        ok_cnt = sum(1 for v in (r.get("results") or {}).values() if v.get("ok"))
+        # 刷新验证快照：让验证回环继续盯这部剧的入库情况
+        try:
+            pending = self.get_data(self._DATA_PENDING) or {}
+            entry = pending.get(str(_tmdbid))
+            if entry is not None:
+                entry["last_refill"] = {
+                    "time": datetime.datetime.now(
+                        tz=pytz.timezone(settings.TZ)).strftime(TIME_FMT),
+                    "links": len(urls), "ok": ok_cnt, "source": source or "hdhive",
+                }
+                self.save_data(self._DATA_PENDING, pending)
+        except Exception as e:
+            logger.debug(f"【{_title}】回填快照刷新失败（不影响）: {e}")
+        return {"success": r.get("ok", False), "message": r.get("detail", ""),
+                "data": {"submitted": len(urls), "ok": ok_cnt,
+                         "failed": len(urls) - ok_cnt,
+                         "via": r.get("via", ""),
+                         "detail": r.get("detail", "")}}
 
     # ==================================================================
     # 配置表单 / 详情页
