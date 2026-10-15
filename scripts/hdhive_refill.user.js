@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RE0影巢缺集回填助手（re0.me → MoviePilot 缺集自动补齐）
 // @namespace    https://github.com/OneFlatWhite/MoviePilot-Plugins
-// @version      1.4.0
+// @version      1.5.0
 // @description  自动拉取 MoviePilot 缺集队列，在 RE0影巢(re0.me) 站内搜索剧名，抓取 115 分享链接回填给 MP 插件转存补齐。支持全自动巡队 / 单剧手动找 / 本页链接回填（可选剧）。
 // @author       OneFlatWhite
 // @match        *://re0.me/*
@@ -13,12 +13,61 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // ============ 侦察模式：记录 re0.me 前端真实调用的 JSON API ============
+  window.__mpx_netlog = window.__mpx_netlog || [];
+  (function installNetLog() {
+    const SKIP = /\.(png|jpe?g|gif|svg|webp|ico|css|woff2?|ttf)(\?|$)/i;
+    function rec(kind, method, url, status, snippet) {
+      try {
+        if (!url || SKIP.test(url)) return;
+        if (url.startsWith('data:')) return;
+        if (window.__mpx_netlog.length > 300) return;
+        window.__mpx_netlog.push({
+          t: new Date().toTimeString().slice(0, 8), kind, method,
+          url: String(url).slice(0, 300), status: status || '',
+          resp: (snippet || '').slice(0, 600),
+        });
+      } catch (e) {}
+    }
+    if (!window.__mpx_patched_fetch) {
+      window.__mpx_patched_fetch = true;
+      const of = window.fetch;
+      if (of) window.fetch = async function (...args) {
+        const req = args[0];
+        const url = (typeof req === 'string') ? req : (req && req.url) || '';
+        const method = (args[1] && args[1].method) || (req && req.method) || 'GET';
+        const resp = await of.apply(this, args);
+        try {
+          const cl = resp.clone();
+          cl.text().then(txt => rec('fetch', method, url, resp.status, txt)).catch(() => {});
+        } catch (e) {}
+        return resp;
+      };
+    }
+    if (!window.__mpx_patched_xhr) {
+      window.__mpx_patched_xhr = true;
+      const oo = XMLHttpRequest.prototype.open;
+      const os = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        this.__mpx_m = m; this.__mpx_u = u; return oo.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        this.addEventListener('load', () => {
+          try { rec('xhr', this.__mpx_m, this.__mpx_u, this.status,
+                    (this.responseType === '' || this.responseType === 'text')
+                      ? this.responseText : ''); } catch (e) {}
+        });
+        return os.apply(this, arguments);
+      };
+    }
+  })();
 
   // ===================== 配置（按需修改） =====================
   const MP_BASE = 'http://192.168.31.40:3000';          // MoviePilot 地址
@@ -366,6 +415,7 @@
           <button id="mpx-auto">▶ 开始自动找</button>
           <button id="mpx-refresh">刷新队列</button>
           <button id="mpx-page">本页链接回填</button>
+          <button id="mpx-recon" style="background:#b8860b">📋 导出侦察日志</button>
         </div>
         <div class="row"><small>队列前 8 部（点剧名去搜索，[单找]自动抓）：</small></div>
         <div id="mpx-tasks"></div>
@@ -384,6 +434,19 @@
       const t = await chooserPick(links);
       if (!t) { log('已取消'); return; }
       await submitLinks(t, links, 're0_manual');
+    };
+    document.getElementById('mpx-recon').onclick = async () => {
+      const data = JSON.stringify({
+        url: location.href, time: new Date().toISOString(),
+        entries: window.__mpx_netlog || [],
+      });
+      try { await navigator.clipboard.writeText(data); log(`已复制 ${window.__mpx_netlog.length} 条网络记录到剪贴板，直接粘贴给助手`); }
+      catch (e) {
+        const ta = document.createElement('textarea');
+        ta.value = data; document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); ta.remove();
+        log(`已复制 ${window.__mpx_netlog.length} 条网络记录到剪贴板`);
+      }
     };
     document.getElementById('mpx-auto').onclick = (ev) => {
       autoRunning = !autoRunning;
