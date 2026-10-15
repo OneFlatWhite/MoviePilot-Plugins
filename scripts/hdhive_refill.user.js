@@ -312,7 +312,7 @@
     saveCur({ tmdbid: t.tmdbid, title: t.title, year: t.year || '',
               missing: t.missing, stage: 'search', steps: 0 });
     log(`🔍 ${t.title}（缺 ${t.missing} 集）开始…`);
-    location.href = '/search?tab=media&query=' + t.tmdbid + '&type=tv_tmdb_id';
+    location.href = 'https://re0.me/search?tab=media&query=' + t.tmdbid + '&type=tv_tmdb_id';
   }
 
   function nextTask() {
@@ -401,6 +401,7 @@
         const href = res.getAttribute('href');
         log(`📎 ${cur.title} 找到 115 资源页…`);
         saveCur({ ...cur, stage: 'resource', steps: cur.steps + 1 });
+        // 真实整页跳转（原 pushState 只改地址栏不加载资源页 DOM，导致抓不到链接）
         location.href = href.startsWith('http') ? href : location.origin + href;
         return;
       }
