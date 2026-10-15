@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RE0影巢缺集回填助手（re0.me → MoviePilot 缺集自动补齐）
 // @namespace    https://github.com/OneFlatWhite/MoviePilot-Plugins
-// @version      1.3.0
+// @version      1.4.0
 // @description  自动拉取 MoviePilot 缺集队列，在 RE0影巢(re0.me) 站内搜索剧名，抓取 115 分享链接回填给 MP 插件转存补齐。支持全自动巡队 / 单剧手动找 / 本页链接回填（可选剧）。
 // @author       OneFlatWhite
 // @match        *://re0.me/*
@@ -207,44 +207,56 @@
     return true;
   }
 
-  async function searchOnSite(t) {
-    const id = String(t.tmdbid);
-    const kw = t.year ? `${t.title} ${t.year}` : t.title;
-    // ---- 到搜索落地页（SPA 内导航）----
-    if (!/re0\.me\/search/.test(location.pathname + location.search) &&
-        !location.pathname.startsWith('/search')) {
-      navTo('/search');
-      await sleep(SEARCH_WAIT_MS);
+  async function findAndUnlock(t) {
+    // 线性直达流程（用户实测链路）：
+    // 搜索(q=tmdbid) → 打开详情 → 网盘区找 /resource/115/ 入口 →
+    // 解锁页确认解锁（0 积分才点，防烧积分）→ 解锁后抓 115 链接
+    navTo('/search?tab=media&type=tv_tmdb_id&q=' + t.tmdbid);
+    await sleep(SEARCH_WAIT_MS + 1200);
+    // 打开详情：点含 tmdbid 的结果卡；没有就试第一个结果卡
+    let card = document.querySelector(`a[href*="${t.tmdbid}"]`);
+    if (!card) {
+      card = [...document.querySelectorAll('a,img,div')]
+        .find(e => (e.textContent || '').includes(t.title) && e.closest('a'));
     }
-    // ---- 策略 0（最准）：剧集 TMDB ID 精确查找 ----
-    // 用户实测：搜索页有「剧集 TMDB ID」标签页，输入框直填 ID 点搜索按钮
-    if (await clickByText('剧集 TMDB ID')) {
-      await sleep(900);
-      if (await fillAndSearch(id)) {
-        const links = await harvestOnResults(t);
-        if (links.length) return links;
+    if (card) { card.click(); await sleep(SEARCH_WAIT_MS); }
+    // 详情页网盘区：等 /resource/115/ 入口出现（可能需要向下滚动触发懒加载）
+    let resLinks = [];
+    for (let i = 0; i < 4; i++) {
+      resLinks = [...document.querySelectorAll('a[href*="/resource/115/"]')];
+      if (resLinks.length) break;
+      window.scrollBy(0, 1500);
+      await sleep(1500);
+    }
+    if (!resLinks.length) { log(`❌ ${t.title} 详情页没找到 115 资源入口`); return []; }
+    log(`📎 ${t.title} 发现 ${resLinks.length} 个 115 资源，逐个解锁查看…`);
+    const found = [];
+    for (const rl of resLinks.slice(0, 2)) {
+      try { rl.click(); } catch (e) { continue; }
+      await sleep(SEARCH_WAIT_MS + 1500);
+      if (!/\/resource\//.test(location.href)) {
+        // SPA 可能没跳 URL：只要页面出现解锁按钮也算到位
+        if (!([...document.querySelectorAll('button')]
+            .some(b => (b.textContent || '').includes('解锁')))) continue;
       }
+      // 积分护栏：解锁要花积分（>0）的资源直接跳过，绝不自动点击
+      const m = (document.body.textContent || '').match(/需要使用\s*(\d+)\s*积分/);
+      if (m && parseInt(m[1], 10) > 0) {
+        log(`⏭ 资源需要 ${m[1]} 积分解锁，跳过（不自动消耗）`);
+        history.back(); await sleep(1800); continue;
+      }
+      const unlockBtn = [...document.querySelectorAll('button')]
+        .find(b => (b.textContent || '').includes('解锁'));
+      if (unlockBtn) {
+        unlockBtn.click();
+        log('🔓 已点确认解锁，等待链接生成…');
+        await sleep(2500);
+      }
+      const links = await harvestWithRetry();
+      if (links.length) { found.push(...links); break; }
+      history.back(); await sleep(2000);
     }
-    // ---- 策略 1：TMDB 聚合页填 ID（不切标签直接搜 ID）----
-    await clickByText('TMDB');
-    await sleep(600);
-    if (await fillAndSearch(id)) {
-      const links = await harvestOnResults(t);
-      if (links.length) return links;
-    }
-    // ---- 策略 2：聚合页填片名（含年份）----
-    if (await fillAndSearch(kw)) {
-      const links = await harvestOnResults(t);
-      if (links.length) return links;
-    }
-    // ---- 策略 3：切「剧集」标签填片名（纯剧名不带年份）----
-    await clickByText('剧集');
-    await sleep(600);
-    if (await fillAndSearch(t.title)) {
-      const links = await harvestOnResults(t);
-      if (links.length) return links;
-    }
-    return [];
+    return found.slice(0, MAX_LINKS_PER_TASK);
   }
 
   async function submitLinks(t, links, source) {
@@ -270,7 +282,7 @@
     if (failCnt(t) >= 2) { log(`⏭ ${t.title} 连续失败≥2 次，今天不再试`); return; }
     log(`🔍 ${t.title}（缺 ${t.missing} 集）站内搜索…`);
     const kw = t.year ? `${t.title} ${t.year}` : t.title;
-    const links = await searchOnSite(t);
+    const links = await findAndUnlock(t);
     if (!links.length) {
       addFail(t);
       log(`❌ ${t.title} 没抓到 115 链接`);
