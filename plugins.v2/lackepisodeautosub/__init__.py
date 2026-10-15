@@ -802,7 +802,7 @@ class LackEpisodeAutoSub(_PluginBase):
     # 插件图标（本仓库 icons/ 目录）
     plugin_icon = "https://raw.githubusercontent.com/OneFlatWhite/MoviePilot-Plugins/main/icons/lackepisodeautosub.png"
     # 插件版本
-    plugin_version = "1.9.16"
+    plugin_version = "1.9.17"
     # 插件作者
     plugin_author = "coldbrew"
     # 作者主页
@@ -1614,7 +1614,7 @@ class LackEpisodeAutoSub(_PluginBase):
             {
                 "path": "/refill_submit",
                 "endpoint": self.api_refill_submit,
-                "methods": ["POST"],
+                "methods": ["POST", "GET"],
                 "auth": "apikey",
                 "summary": "回填 115 分享链接（油猴补齐桥）",
                 "description": "body 传 {\"tmdbid\", \"title\", \"links\": \"115分享链接（每行一条，"
@@ -6022,9 +6022,8 @@ class LackEpisodeAutoSub(_PluginBase):
             return {"success": False, "message": str(e),
                     "data": {"count": 0, "items": []}}
 
-    def api_refill_submit(self, tmdbid: int = 0, title: str = _BODY_STR,
-                          links: str = _BODY_STR,
-                          source: str = _BODY_STR) -> Dict[str, Any]:
+    def api_refill_submit(self, tmdbid: int = 0, title: str = "",
+                          links: str = "", source: str = "") -> Dict[str, Any]:
         """
         API 端点：油猴/人工回填 115 分享链接 → 提交 SA 转存。
         body（JSON）: {"tmdbid": 123, "title": "剧名", "links": "https://115.com/s/xx#pwd\\n...",
