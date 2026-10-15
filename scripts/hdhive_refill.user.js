@@ -276,7 +276,7 @@
     let html = document.documentElement.innerHTML || '';
     try { html = decodeURIComponent(html); } catch (e) {}
     html = html.replace(/\\/g, '/').replace(/\u002F/gi, '/');
-    const rx = /https?:\/\/(?:www\.)?(?:115|115cdn)\.com\/s\/[0-9A-Za-z]+(?:\?password=[0-9A-Za-z]+)?/g;
+    const rx = /https?:\/\/(?:www\.)?(?:115|115cdn|anxia)\.com\/s\/[0-9A-Za-z]+(?:\?password=[0-9A-Za-z]+)?/g;
     const set = new Set();
     let m;
     while ((m = rx.exec(html)) !== null && set.size < MAX_LINKS_PER_TASK) set.add(m[0]);
