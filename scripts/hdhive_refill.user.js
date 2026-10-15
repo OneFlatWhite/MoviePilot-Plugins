@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RE0影巢缺集回填助手（re0.me → MoviePilot 缺集自动补齐）
 // @namespace    https://github.com/OneFlatWhite/MoviePilot-Plugins
-// @version      1.2.0
+// @version      1.3.0
 // @description  自动拉取 MoviePilot 缺集队列，在 RE0影巢(re0.me) 站内搜索剧名，抓取 115 分享链接回填给 MP 插件转存补齐。支持全自动巡队 / 单剧手动找 / 本页链接回填（可选剧）。
 // @author       OneFlatWhite
 // @match        *://re0.me/*
@@ -151,13 +151,29 @@
 
   function findSearchInput() {
     return document.querySelector(
-      'input[type=search],input[placeholder*="搜索"],input[placeholder*="搜 索"],' +
-      'input[placeholder*="search" i],input[name="keyword"],input[name="q"]');
+      'input[placeholder*="搜索电影"],input[placeholder*="输入剧集 TMDB"],' +
+      'input[type=search],input[placeholder*="搜索"],input[placeholder*="search" i]');
   }
-  function findTmdbInput() {
-    // RE0 搜索页的 TMDB ID 输入框（placeholder 形如「输入剧集 TMDB ID...」）
-    return document.querySelector(
-      'input[placeholder*="TMDB" i],input[placeholder*="tmdb"]');
+  // React 受控输入框必须用原生 setter 写值，否则组件状态不变（页面显示为空）
+  function setReactInput(input, value) {
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    if (desc && desc.set) desc.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  async function clickByText(txt) {
+    const els = [...document.querySelectorAll('button,div,span,a,li,p')]
+      .filter(e => e.children.length === 0 && (e.textContent || '').trim() === txt
+        && !e.closest('header,nav'));
+    if (els.length) { els[els.length - 1].click(); return true; }
+    return false;
+  }
+  async function clickSearchButton() {
+    const btn = [...document.querySelectorAll('button')]
+      .find(b => (b.textContent || '').includes('搜索'));
+    if (btn) { btn.click(); return true; }
+    return false;
   }
   async function harvestOnResults(t) {
     // 结果页直接抓 115；抓不到再看是否有指向该 tmdbid 的详情入口，点进去再抓
@@ -176,51 +192,55 @@
     return [];
   }
 
+  async function fillAndSearch(value) {
+    const input = findSearchInput();
+    if (!input) return false;
+    input.focus();
+    setReactInput(input, value);
+    await sleep(400);
+    const clicked = await clickSearchButton();
+    if (!clicked) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, bubbles: true }));
+    }
+    await sleep(SEARCH_WAIT_MS);
+    return true;
+  }
+
   async function searchOnSite(t) {
     const id = String(t.tmdbid);
-    // ---- 策略 0（最准）：剧集 TMDB ID 精确查找 ----
-    // RE0 搜索页结构（用户实测）：/search?tab=media&type=tv_tmdb_id，输入框直填 ID
-    for (const rt of [
-      `/search?tab=media&type=tv_tmdb_id&keyword=${id}`,
-      `/search?tab=media&type=tv_tmdb_id&q=${id}`,
-      `/search?tab=media&type=tv_tmdb_id&kw=${id}`,
-      `/search?tab=media&type=tv_tmdb_id&word=${id}`,
-    ]) {
-      navTo(rt);
-      await sleep(SEARCH_WAIT_MS);
-      const links = await harvestOnResults(t);
-      if (links.length) return links;
-    }
-    // ---- 策略 0.5：到 TMDB ID 页直接驱动输入框回车 ----
-    navTo('/search?tab=media&type=tv_tmdb_id');
-    await sleep(SEARCH_WAIT_MS);
-    const tin = findTmdbInput();
-    if (tin) {
-      tin.focus();
-      tin.value = id;
-      tin.dispatchEvent(new Event('input', { bubbles: true }));
-      tin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-      const links = await harvestOnResults(t);
-      if (links.length) return links;
-    }
-    // ---- 策略 1：页面自带搜索框 → 片名回车（兜底） ----
     const kw = t.year ? `${t.title} ${t.year}` : t.title;
-    const input = findSearchInput();
-    if (input) {
-      input.focus();
-      input.value = kw;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-      await sleep(600);
+    // ---- 到搜索落地页（SPA 内导航）----
+    if (!/re0\.me\/search/.test(location.pathname + location.search) &&
+        !location.pathname.startsWith('/search')) {
+      navTo('/search');
+      await sleep(SEARCH_WAIT_MS);
+    }
+    // ---- 策略 0（最准）：剧集 TMDB ID 精确查找 ----
+    // 用户实测：搜索页有「剧集 TMDB ID」标签页，输入框直填 ID 点搜索按钮
+    if (await clickByText('剧集 TMDB ID')) {
+      await sleep(900);
+      if (await fillAndSearch(id)) {
+        const links = await harvestOnResults(t);
+        if (links.length) return links;
+      }
+    }
+    // ---- 策略 1：TMDB 聚合页填 ID（不切标签直接搜 ID）----
+    await clickByText('TMDB');
+    await sleep(600);
+    if (await fillAndSearch(id)) {
       const links = await harvestOnResults(t);
       if (links.length) return links;
     }
-    // ---- 策略 2：片名搜索路由（兜底） ----
-    for (const rt of ['/search?keyword=' + encodeURIComponent(kw),
-                      '/search?q=' + encodeURIComponent(kw),
-                      '/search/' + encodeURIComponent(kw)]) {
-      navTo(rt);
-      await sleep(SEARCH_WAIT_MS);
+    // ---- 策略 2：聚合页填片名（含年份）----
+    if (await fillAndSearch(kw)) {
+      const links = await harvestOnResults(t);
+      if (links.length) return links;
+    }
+    // ---- 策略 3：切「剧集」标签填片名（纯剧名不带年份）----
+    await clickByText('剧集');
+    await sleep(600);
+    if (await fillAndSearch(t.title)) {
       const links = await harvestOnResults(t);
       if (links.length) return links;
     }
