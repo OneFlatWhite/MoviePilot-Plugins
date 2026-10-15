@@ -6,6 +6,10 @@
 // @author       OneFlatWhite
 // @match        *://re0.me/*
 // @match        *://www.re0.me/*
+// @match        *://115.com/*
+// @match        *://www.115.com/*
+// @match        *://115cdn.com/*
+// @match        *://anxia.com/*
 // @match        *://hdhive.com/*
 // @connect      192.168.31.40
 // @connect      localhost
@@ -345,6 +349,26 @@
     const cur = getCur();
     if (!cur) return;
     const url = location.pathname + location.search;
+    // ---- 115.com/?goto=<分享链接> 页面：解锁跳转的载体，解析并回填 ----
+    if (location.hostname.match(/115\.com|115cdn\.com|anxia\.com/) &&
+        location.search.includes('goto=')) {
+      busy = true;
+      try {
+        const cur = getCur();
+        const gotoUrl = decodeURIComponent(
+          (location.search.match(/goto=([^&]+)/) || [])[1] || '');
+        const m = gotoUrl.match(/https?:\/\/[^&]+/);
+        if (cur && m) {
+          log(`📤 从 115 跳转解析到分享链接，回填【${cur.title}】…`);
+          submitLinks(cur, [m[0]], 're0_goto');
+          clearCur();
+        }
+      } catch (e) { log('goto 解析失败：' + e.message); }
+      busy = false;
+      if (autoRunning) setTimeout(pump, 2000);
+      return;
+    }
+    if (location.hostname.match(/115\.com|115cdn\.com|anxia\.com/)) return;
     busy = true;
     try {
       // ---- 搜索结果页：找结果卡 href → 进详情 ----
@@ -393,10 +417,20 @@
           const btn = [...document.querySelectorAll('button')]
             .find(b => (b.textContent || '').includes('解锁'));
           if (btn && (!m || parseInt(m[1], 10) === 0)) {
-            log('🔓 0 积分资源，点确认解锁…');
+            log('🔓 0 积分资源，点确认解锁 → 跳转 115 分享页…');
+            saveCur({ ...cur, stage: 'goto', steps: cur.steps + 1 });
             btn.click();
-            await sleep(3500);
+            await sleep(4000);
+            // 若页面内已出现链接（未跳转），就地抓取
             links = harvest115decoded();
+            if (links.length) {
+              submitLinks(cur, links.slice(0, MAX_LINKS_PER_TASK), 're0_auto');
+              clearCur();
+              busy = false;
+              if (autoRunning) setTimeout(pump, TASK_GAP_MS);
+            }
+            // 已跳转到 115.com/?goto= 的情况由 goto 分支处理（cur 保留）
+            return;
           }
         }
         if (!links.length) throw new Error('资源页没抓到 115 链接');
