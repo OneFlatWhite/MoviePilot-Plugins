@@ -134,8 +134,17 @@
   function doneKey(t) { return 'mpx_done_' + t.tmdbid; }
   function isDone(t) { return GM_getValue(doneKey(t), '') === todayStr(); }
   function markDone(t) { GM_setValue(doneKey(t), todayStr()); }
-  function failCnt(t) { return GM_getValue('mpx_fail_' + t.tmdbid, 0); }
-  function addFail(t) { GM_setValue('mpx_fail_' + t.tmdbid, failCnt(t) + 1); }
+  function failCnt(t) {
+    if (GM_getValue('mpx_failday_' + t.tmdbid, '') !== todayStr()) return 0;
+    return GM_getValue('mpx_fail_' + t.tmdbid, 0);
+  }
+  function addFail(t) {
+    if (GM_getValue('mpx_failday_' + t.tmdbid, '') !== todayStr()) {
+      GM_setValue('mpx_failday_' + t.tmdbid, todayStr());
+      GM_setValue('mpx_fail_' + t.tmdbid, 0);
+    }
+    GM_setValue('mpx_fail_' + t.tmdbid, failCnt(t) + 1);
+  }
 
   // ---------- MP API ----------
   function mpGet(url) {
@@ -326,9 +335,14 @@
     try {
       // ---- 搜索结果页：找结果卡 href → 进详情 ----
       if (cur.stage === 'search' && url.includes('query=' + cur.tmdbid)) {
-        await sleep(2800);
-        let card = document.querySelector('a[href^="/tv/"]')
-          || [...document.querySelectorAll('a')].find(a => (a.textContent || '').includes(cur.title));
+        let card = null;
+        for (let i = 0; i < 10; i++) {
+          card = document.querySelector('a[href^="/tv/"]')
+            || [...document.querySelectorAll('a')].find(a => (a.textContent || '').includes(cur.title));
+          if (card && card.getAttribute('href')) break;
+          if ((document.body.textContent || '').includes('没有搜索到相关内容')) break;
+          await sleep(1500);
+        }
         if (!card || !card.getAttribute('href')) throw new Error('搜索无结果卡');
         const href = card.getAttribute('href');
         saveCur({ ...cur, stage: 'detail', steps: cur.steps + 1 });
