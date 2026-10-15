@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RE0影巢缺集回填助手（re0.me → MoviePilot 缺集自动补齐）
 // @namespace    https://github.com/OneFlatWhite/MoviePilot-Plugins
-// @version      1.1.0
+// @version      1.2.0
 // @description  自动拉取 MoviePilot 缺集队列，在 RE0影巢(re0.me) 站内搜索剧名，抓取 115 分享链接回填给 MP 插件转存补齐。支持全自动巡队 / 单剧手动找 / 本页链接回填（可选剧）。
 // @author       OneFlatWhite
 // @match        *://re0.me/*
@@ -25,8 +25,8 @@
   const MP_APIKEY = 'WangMP2026WeChat88';               // MP 的 API_TOKEN
   const POLL_SEC = 60;                                  // 队列轮询间隔（秒）
   const TASK_GAP_MS = 9000;                             // 自动模式两部剧之间间隔
-  const SEARCH_WAIT_MS = 4000;                          // 搜索路由切换后单次等待
-  const SEARCH_RETRY = 4;                               // 搜索后抓取重试轮数
+  const SEARCH_WAIT_MS = 3000;                          // 搜索路由切换后单次等待
+  const SEARCH_RETRY = 3;                               // 搜索后抓取重试轮数
   const MAX_LINKS_PER_TASK = 3;                         // 每部剧最多回填的 115 链接数
   // ============================================================
 
@@ -154,25 +154,74 @@
       'input[type=search],input[placeholder*="搜索"],input[placeholder*="搜 索"],' +
       'input[placeholder*="search" i],input[name="keyword"],input[name="q"]');
   }
+  function findTmdbInput() {
+    // RE0 搜索页的 TMDB ID 输入框（placeholder 形如「输入剧集 TMDB ID...」）
+    return document.querySelector(
+      'input[placeholder*="TMDB" i],input[placeholder*="tmdb"]');
+  }
+  async function harvestOnResults(t) {
+    // 结果页直接抓 115；抓不到再看是否有指向该 tmdbid 的详情入口，点进去再抓
+    let links = await harvestWithRetry();
+    if (links.length) return links;
+    const detail = document.querySelector(`a[href*="${t.tmdbid}"]`);
+    if (detail) {
+      const back = location.href;
+      detail.click();
+      await sleep(SEARCH_WAIT_MS);
+      links = await harvestWithRetry();
+      if (links.length) return links;
+      navTo(back);
+      await sleep(1500);
+    }
+    return [];
+  }
 
-  async function searchOnSite(keyword) {
-    // 策略 1：页面自带搜索框 → 填词回车
+  async function searchOnSite(t) {
+    const id = String(t.tmdbid);
+    // ---- 策略 0（最准）：剧集 TMDB ID 精确查找 ----
+    // RE0 搜索页结构（用户实测）：/search?tab=media&type=tv_tmdb_id，输入框直填 ID
+    for (const rt of [
+      `/search?tab=media&type=tv_tmdb_id&keyword=${id}`,
+      `/search?tab=media&type=tv_tmdb_id&q=${id}`,
+      `/search?tab=media&type=tv_tmdb_id&kw=${id}`,
+      `/search?tab=media&type=tv_tmdb_id&word=${id}`,
+    ]) {
+      navTo(rt);
+      await sleep(SEARCH_WAIT_MS);
+      const links = await harvestOnResults(t);
+      if (links.length) return links;
+    }
+    // ---- 策略 0.5：到 TMDB ID 页直接驱动输入框回车 ----
+    navTo('/search?tab=media&type=tv_tmdb_id');
+    await sleep(SEARCH_WAIT_MS);
+    const tin = findTmdbInput();
+    if (tin) {
+      tin.focus();
+      tin.value = id;
+      tin.dispatchEvent(new Event('input', { bubbles: true }));
+      tin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+      const links = await harvestOnResults(t);
+      if (links.length) return links;
+    }
+    // ---- 策略 1：页面自带搜索框 → 片名回车（兜底） ----
+    const kw = t.year ? `${t.title} ${t.year}` : t.title;
     const input = findSearchInput();
     if (input) {
       input.focus();
-      input.value = keyword;
+      input.value = kw;
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
       await sleep(600);
-      const l1 = await harvestWithRetry();
-      if (l1.length) return l1;
+      const links = await harvestOnResults(t);
+      if (links.length) return links;
     }
-    // 策略 2：RE0 常见搜索路由（SPA 路由切换）
-    const kws = encodeURIComponent(keyword);
-    for (const rt of ['/search?keyword=' + kws, '/search?q=' + kws, '/search/' + kws]) {
+    // ---- 策略 2：片名搜索路由（兜底） ----
+    for (const rt of ['/search?keyword=' + encodeURIComponent(kw),
+                      '/search?q=' + encodeURIComponent(kw),
+                      '/search/' + encodeURIComponent(kw)]) {
       navTo(rt);
       await sleep(SEARCH_WAIT_MS);
-      const links = await harvestWithRetry();
+      const links = await harvestOnResults(t);
       if (links.length) return links;
     }
     return [];
@@ -201,7 +250,7 @@
     if (failCnt(t) >= 2) { log(`⏭ ${t.title} 连续失败≥2 次，今天不再试`); return; }
     log(`🔍 ${t.title}（缺 ${t.missing} 集）站内搜索…`);
     const kw = t.year ? `${t.title} ${t.year}` : t.title;
-    const links = await searchOnSite(kw);
+    const links = await searchOnSite(t);
     if (!links.length) {
       addFail(t);
       log(`❌ ${t.title} 没抓到 115 链接`);
